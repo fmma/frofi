@@ -679,12 +679,26 @@ class Switcher(Gtk.Window):
                 w.activate(t)
 
     def close_selected(self):
-        wid = self.selected_wid()
-        if wid:
-            w = self.wnck_window(wid)
-            if w is not None:
-                w.close(self.server_time())
-            self.schedule(90, lambda: self.rebuild_windows())
+        row = self.listbox.get_selected_row()
+        wid = getattr(row, "wid", None) if row else None
+        if not wid:
+            return
+        # Keep the selection at the same position so repeated Delete walks
+        # down the list, rather than jumping back to the active/first row.
+        vis = self.visible_rows()
+        idx = vis.index(row) if row in vis else 0
+        w = self.wnck_window(wid)
+        if w is not None:
+            w.close(self.server_time())
+
+        def after():
+            self.rebuild_windows()
+            vis2 = self.visible_rows()
+            if vis2:
+                target = vis2[min(idx, len(vis2) - 1)]
+                self.listbox.select_row(target)
+                self.scroll_to(target)
+        self.schedule(90, after)
 
     def move_to_ws(self, delta):
         wid = self.selected_wid()
