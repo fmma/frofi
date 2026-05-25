@@ -97,7 +97,10 @@ HINT_DRUN = ("<b>Enter</b> launch   <b>Ctrl+Alt+←/→</b> switch ws   "
 HINT_TAG = "<b>Enter</b> save tag   <b>Esc</b> cancel"
 
 # Layout-mode glyphs: floating window, maximized, left half, right half.
-MODE_GLYPHS = {"window": "□", "max": "■", "left": "◧", "right": "◨"}
+# The floating glyph is an outlined square with an inner block (rather than a
+# plain outline) so it stays distinct from the solid maximized square when a
+# selected row inverts the colors; fill polarity alone would read ambiguously.
+MODE_GLYPHS = {"window": "▣", "max": "■", "left": "◧", "right": "◨"}
 
 
 # --- client ------------------------------------------------------------------
