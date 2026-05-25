@@ -11,6 +11,9 @@ rofi-based window switcher with an always-resident equivalent.
 ## Features
 
 - Per-workspace window list, active window preselected, type-to-filter.
+- Workspaces overview mode listing every workspace's windows at once,
+  each group behind a labeled divider; empty workspaces and groups whose
+  windows all filter out hide their divider.
 - Stable F1-F12 slots, per workspace, held in memory for the daemon's
   lifetime; slots keep their holes when a window closes and reclaim the
   lowest empty index. A daemon restart starts from empty slots.
@@ -19,8 +22,9 @@ rofi-based window switcher with an always-resident equivalent.
 - Layout-mode glyph per row: `▣` floating, `■` maximized, `◧`/`◨` left
   or right half-tile, with the monitor number when more than one is
   attached.
-- Built-in drun-style application launcher (Tab toggles it; Ctrl+R
-  re-reads desktop files to pick up installed or removed apps).
+- Built-in drun-style application launcher (Ctrl+R re-reads desktop
+  files to pick up installed or removed apps). Tab cycles windows,
+  workspaces, and the launcher; Shift+Tab cycles back.
 - Direct keyboard actions: Enter activates and dismisses, Ctrl+Enter
   activates a window while leaving the switcher open, Delete closes,
   Alt+Left/Right move a window across workspaces, Ctrl+Alt+Left/Right

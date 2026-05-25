@@ -81,6 +81,11 @@ CSS = b"""
 #frofi row:selected .slot { color: #eee8d5; }
 #frofi .mode { color: #586875; font-family: monospace; }
 #frofi row:selected .mode { color: #eee8d5; }
+/* Workspace-group divider in workspaces mode: a labeled rule, on the base
+   background so it reads as a separator rather than a striped list item. */
+#frofi row.wsdivider { background-color: #fdf6e3; }
+#frofi .wslabel { color: #586875; font-size: 9pt; }
+#frofi .wsdivider separator { background-color: #93a1a1; min-height: 1px; }
 #frofi .hint {
     color: #586875; font-size: 9pt; padding: 6px 12px;
     border-top: 2px dashed #002b36;
@@ -91,9 +96,14 @@ HINT_WINDOW = ("<b>Ctrl+Enter</b> focus   <b>Del</b> close   "
                "<b>Alt+←/→</b> move ws   <b>Alt+↑/↓</b> reorder   "
                "<b>Ctrl+Alt+←/→</b> switch ws\n"
                "<b>Super+←/↑/→/↓</b> tile   <b>Super+Shift+←/→</b> monitor   "
-               "<b>Ctrl+T</b> tag   <b>Tab</b> apps")
+               "<b>Ctrl+T</b> tag   <b>Tab</b> cycle")
+HINT_WS = ("<b>Ctrl+Enter</b> focus   <b>Del</b> close   "
+           "<b>Alt+←/→</b> move ws   <b>Alt+↑/↓</b> reorder   "
+           "<b>Ctrl+Alt+←/→</b> switch ws\n"
+           "<b>Super+←/↑/→/↓</b> tile   <b>Super+Shift+←/→</b> monitor   "
+           "<b>Ctrl+T</b> tag   <b>Tab</b> cycle")
 HINT_DRUN = ("<b>Enter</b> launch   <b>Ctrl+Alt+←/→</b> switch ws   "
-             "<b>Ctrl+R</b> refresh   <b>Tab</b> windows")
+             "<b>Ctrl+R</b> refresh   <b>Tab</b> cycle")
 HINT_TAG = "<b>Enter</b> save tag   <b>Esc</b> cancel"
 
 # Layout-mode glyphs: floating window, maximized, left half, right half.
@@ -202,6 +212,7 @@ class Switcher(Gtk.Window):
         self.tag_target = None      # wid being tagged in tag mode
         self._active_geo = None     # focused window geometry, for monitor pick
         self._row_h = None          # measured row height, for the 12-row viewport
+        self._vis_groups = set()    # ws groups with a visible window (ws mode)
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         box.set_name("frame")               # carries the 1px window frame border
@@ -348,6 +359,32 @@ class Switcher(Gtk.Window):
         self.listbox.add(row)
         return row
 
+    def add_separator(self, label, ws_group=None):
+        # Non-selectable labeled rule between workspace groups in ws mode.
+        # Shown only while its group has a visible window (see _filter).
+        row = Gtk.ListBoxRow()
+        row.search_text = ""
+        row.is_divider = True
+        row.ws_group = ws_group
+        row.set_selectable(False)
+        row.set_activatable(False)
+        row.get_style_context().add_class("wsdivider")
+        rb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        rb.set_margin_top(2); rb.set_margin_bottom(2)
+        rb.set_margin_start(12); rb.set_margin_end(12)
+        left = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        left.set_valign(Gtk.Align.CENTER)
+        lbl = Gtk.Label(label=label, xalign=0.5)
+        lbl.get_style_context().add_class("wslabel")
+        right = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        right.set_valign(Gtk.Align.CENTER)
+        rb.pack_start(left, True, True, 0)
+        rb.pack_start(lbl, False, False, 0)
+        rb.pack_start(right, True, True, 0)
+        row.add(rb)
+        self.listbox.add(row)
+        return row
+
     def clear_rows(self):
         for child in self.listbox.get_children():
             self.listbox.remove(child)
@@ -428,70 +465,75 @@ class Switcher(Gtk.Window):
                     break
         return slots
 
-    def rebuild_windows(self, select_active=False, keep_wid=None):
-        self.mode = "window"
-        self.prompt.set_text("windows:")
-        self.hint.set_markup(HINT_WINDOW)
-        self.clear_rows()
-        ws = self.current_ws()
+    def _prep_rebuild(self):
+        # Shared setup for window/workspace rebuilds: drop slot lists for
+        # workspaces that no longer exist and snapshot the monitor geometry
+        # the indicator uses to label half-tiles and the monitor digit.
         nws = self.num_ws()
-        for k in [k for k in self.slot_map if k >= nws]:   # drop removed ws
+        for k in [k for k in self.slot_map if k >= nws]:
             del self.slot_map[k]
         disp = Gdk.Display.get_default()
         self._monitors = [disp.get_monitor(i).get_geometry()
                           for i in range(disp.get_n_monitors())]
-        win_rows, all_ids = self.list_windows(ws)
-        ordered = [r[0] for r in win_rows]
-        self.slots = self.refresh_slots(ws, ordered)
 
-        tags = self.tags
-        for wid in list(tags):                     # prune tags for dead windows
-            if wid not in all_ids:
-                del tags[wid]
+    def _prune_tags(self, all_ids):
+        live = set(all_ids)
+        for wid in list(self.tags):
+            if wid not in live:
+                del self.tags[wid]
 
+    def _emit_window(self, rec, slot_i, active):
+        wid, inst, title, geo, vmax, hmax = rec
+        if active and int(wid, 16) == active:
+            self._active_geo = geo
+        tag = self.tags.get(wid, "")
+        markup = pango(title)
+        if tag:
+            markup += f"  <span color='#8ab4f8'>[{pango(tag)}]</span>"
+        slot_text = f"F{slot_i + 1}" if slot_i is not None else ""
+        glyph, digit = self.window_indicator(geo, vmax, hmax)
+        search = title + " " + tag
+        icon = self.icon_map.get(inst, inst)
+        return self.add_row(slot_text, glyph, digit, icon, markup, search,
+                            wid=wid)
+
+    def _emit_group(self, win_rows, slots, keep_wid, active,
+                    placeholders=True, ws=None):
+        # One workspace's rows: a fixed row per slot (blank placeholder when
+        # empty, unless placeholders is False) followed by any unslotted
+        # leftovers. Each window row is tagged with its workspace (ws) so the
+        # group divider can track it. Returns the keep/active rows, or None.
         by_id = {r[0]: r for r in win_rows}
-        slot_of = {wid: i for i, wid in enumerate(self.slots) if wid}
-        active = self.active_xid()
-        self._active_geo = None
-        active_row = keep_row = None
-
-        def emit(wid):
-            rec = by_id[wid]
-            inst, title, geo, vmax, hmax = rec[1], rec[2], rec[3], rec[4], rec[5]
-            if active and int(wid, 16) == active:
-                self._active_geo = geo
-            tag = tags.get(wid, "")
-            markup = pango(title)
-            if tag:
-                markup += f"  <span color='#8ab4f8'>[{pango(tag)}]</span>"
-            slot_i = slot_of.get(wid)
-            slot_text = f"F{slot_i + 1}" if slot_i is not None else ""
-            glyph, digit = self.window_indicator(geo, vmax, hmax)
-            search = title + " " + tag
-            icon = self.icon_map.get(inst, inst)
-            return self.add_row(slot_text, glyph, digit, icon, markup, search,
-                                wid=wid)
-
-        for i in range(12):                        # one fixed row per slot
-            wid = self.slots[i]
+        slot_of = {wid: i for i, wid in enumerate(slots) if wid}
+        keep_row = active_row = None
+        for i in range(12):
+            wid = slots[i]
             if wid and wid in by_id:
-                r = emit(wid)
+                r = self._emit_window(by_id[wid], i, active)
+                r.ws_group = ws
                 if wid == keep_wid:
                     keep_row = r
                 if active and int(wid, 16) == active:
                     active_row = r
-            else:                                  # empty slot: blank placeholder
+            elif placeholders:
                 self.add_row(f"F{i + 1}", "", "", None, "", "", selectable=False)
-        for tup in win_rows:                       # any unslotted leftovers
+        for tup in win_rows:
             wid = tup[0]
             if wid not in slot_of:
-                r = emit(wid)
+                r = self._emit_window(tup, None, active)
+                r.ws_group = ws
                 if wid == keep_wid:
                     keep_row = r
                 if active and int(wid, 16) == active:
                     active_row = r
+        return keep_row, active_row
 
+    def _finish_select(self, keep_row, active_row, select_active):
         self.listbox.show_all()
+        # GtkListBox runs the filter at row-insert time, so dividers were
+        # tested against a stale _vis_groups (computed for the prior rebuild).
+        # Re-filter now that this rebuild's _vis_groups is in place.
+        self.listbox.invalidate_filter()
         target = keep_row or (active_row if select_active else None)
         if target is None:
             vis = self.visible_rows()      # first real window row, not a slot gap
@@ -500,6 +542,73 @@ class Switcher(Gtk.Window):
             self.listbox.select_row(target)
             self.scroll_to(target)
         self.update_counter()
+
+    def rebuild_windows(self, select_active=False, keep_wid=None):
+        self.mode = "window"
+        self.prompt.set_text("windows:")
+        self.hint.set_markup(HINT_WINDOW)
+        self.clear_rows()
+        self._prep_rebuild()
+        ws = self.current_ws()
+        win_rows, all_ids = self.list_windows(ws)
+        self._prune_tags(all_ids)
+        self.slots = self.refresh_slots(ws, [r[0] for r in win_rows])
+        active = self.active_xid()
+        self._active_geo = None
+        keep_row, active_row = self._emit_group(win_rows, self.slots,
+                                                keep_wid, active)
+        self._finish_select(keep_row, active_row, select_active)
+
+    def _ws_label(self, ws):
+        wsobj = self.screen.get_workspace(ws)
+        name = wsobj.get_name() if wsobj is not None else None
+        return name or f"workspace {ws + 1}"
+
+    def rebuild_ws(self, select_active=False, keep_wid=None):
+        # Like windows mode, but stacks every workspace's full 12-slot
+        # scaffold top to bottom, each behind a labeled divider.
+        self.mode = "ws"
+        self.prompt.set_text("workspaces:")
+        self.hint.set_markup(HINT_WS)
+        self.clear_rows()
+        self._prep_rebuild()
+        # ws mode lists per-window workspace membership across every group. A
+        # cross-workspace move doesn't activate the target here, so without a
+        # synchronous refresh Wnck can still report the window's old workspace
+        # and the newly-occupied group's divider would stay hidden.
+        self.screen.force_update()
+        cur = self.current_ws()
+        active = self.active_xid()
+        self._active_geo = None
+        keep_row = active_row = None
+        all_ids = []
+        for ws in range(self.num_ws()):
+            self.add_separator(self._ws_label(ws), ws_group=ws)
+            win_rows, all_ids = self.list_windows(ws)   # all_ids is ws-agnostic
+            slots = self.refresh_slots(ws, [r[0] for r in win_rows])
+            if ws == cur:
+                self.slots = slots          # F-keys still target the current ws
+            kr, ar = self._emit_group(win_rows, slots, keep_wid, active,
+                                      placeholders=False, ws=ws)
+            keep_row = keep_row or kr
+            active_row = active_row or ar
+        self._prune_tags(all_ids)
+        self._recompute_visible_groups()
+        self._finish_select(keep_row, active_row, select_active)
+
+    def rebuild_current(self, **kw):
+        # Re-render whichever list mode is active, after an action mutated it.
+        if self.mode == "ws":
+            self.rebuild_ws(**kw)
+        else:
+            self.rebuild_windows(**kw)
+
+    def wid_ws(self, wid):
+        w = self.wnck_window(wid)
+        if w is None:
+            return self.current_ws()
+        wsobj = w.get_workspace()
+        return wsobj.get_number() if wsobj is not None else self.current_ws()
 
     # --- launcher list -------------------------------------------------------
     def rebuild_drun(self):
@@ -527,7 +636,17 @@ class Switcher(Gtk.Window):
     def _filter(self, row):
         if self.mode == "tag":
             return True
+        if getattr(row, "is_divider", False):
+            return row.ws_group in self._vis_groups   # only if group has matches
         return self.entry.get_text().lower() in row.search_text
+
+    def _recompute_visible_groups(self):
+        # Workspace groups with at least one window passing the current filter,
+        # used to hide dividers for empty or fully-filtered-out groups.
+        q = self.entry.get_text().lower()
+        self._vis_groups = {r.ws_group for r in self.listbox.get_children()
+                            if r.get_selectable() and q in r.search_text
+                            and getattr(r, "ws_group", None) is not None}
 
     def visible_rows(self):
         if self.mode == "tag":
@@ -554,6 +673,7 @@ class Switcher(Gtk.Window):
         self._sync_placeholder()
         if self.mode == "tag":
             return
+        self._recompute_visible_groups()
         self.listbox.invalidate_filter()
         vis = self.visible_rows()
         if vis and self.listbox.get_selected_row() not in vis:
@@ -761,7 +881,7 @@ class Switcher(Gtk.Window):
             w.close(self.server_time())
 
         def after():
-            self.rebuild_windows()
+            self.rebuild_current()
             vis2 = self.visible_rows()
             if vis2:
                 target = vis2[min(idx, len(vis2) - 1)]
@@ -773,15 +893,22 @@ class Switcher(Gtk.Window):
         wid = self.selected_wid()
         if not wid:
             return
-        target = self.current_ws() + delta   # clamp, no wraparound
+        # In ws mode the selected window may be on any workspace, so move it
+        # relative to its own; in windows mode it is on the current one.
+        base = self.wid_ws(wid) if self.mode == "ws" else self.current_ws()
+        target = base + delta   # clamp, no wraparound
         if target < 0 or target >= self.num_ws():
             return
         w = self.wnck_window(wid)
         wsobj = self.screen.get_workspace(target)
         if w is not None and wsobj is not None:
             w.move_to_workspace(wsobj)
-            wsobj.activate(self.server_time())   # follow the window across
-        self.schedule(90, lambda: self.rebuild_windows(select_active=True))
+            if self.mode != "ws":
+                wsobj.activate(self.server_time())   # follow the window across
+        if self.mode == "ws":
+            self.schedule(90, lambda: self.rebuild_ws(keep_wid=wid))
+        else:
+            self.schedule(90, lambda: self.rebuild_windows(select_active=True))
 
     def switch_ws(self, delta):
         target = self.current_ws() + delta   # clamp, no wraparound
@@ -834,7 +961,7 @@ class Switcher(Gtk.Window):
         else:                                   # "left" / "right"
             _i, mon = self._monitor_at(gx + gw // 2, gy + gh // 2)
             self._tile(w, mon.get_workarea(), mode)
-        self.schedule(90, lambda: self.rebuild_windows(keep_wid=wid))
+        self.schedule(90, lambda: self.rebuild_current(keep_wid=wid))
 
     def move_to_monitor(self, delta):
         wid = self.selected_wid()
@@ -866,13 +993,13 @@ class Switcher(Gtk.Window):
             nx = max(darea.x, min(nx, darea.x + darea.width - gw))
             ny = max(darea.y, min(ny, darea.y + darea.height - gh))
             self._move_resize(w, nx, ny, gw, gh)
-        self.schedule(90, lambda: self.rebuild_windows(keep_wid=wid))
+        self.schedule(90, lambda: self.rebuild_current(keep_wid=wid))
 
     def reorder(self, delta):
         wid = self.selected_wid()
         if not wid:
             return
-        ws = self.current_ws()
+        ws = self.wid_ws(wid) if self.mode == "ws" else self.current_ws()
         slots = self.slots_for(ws)
         if wid not in slots:
             return
@@ -880,13 +1007,14 @@ class Switcher(Gtk.Window):
         dst = src + delta
         if 0 <= dst <= 11:
             slots[src], slots[dst] = slots[dst], slots[src]
-            self.rebuild_windows(keep_wid=wid)
+            self.rebuild_current(keep_wid=wid)
 
     # --- inline tag editing --------------------------------------------------
     def begin_tag(self):
         wid = self.selected_wid()
         if not wid:
             return
+        self._tag_return = self.mode    # window or ws; restored on commit/cancel
         self.tag_target = wid
         self.mode = "tag"
         self.prompt.set_text("tag:")
@@ -903,12 +1031,14 @@ class Switcher(Gtk.Window):
         wid = self.tag_target
         self.tag_target = None
         self.entry.set_text("")
-        self.rebuild_windows(keep_wid=wid)
+        self.mode = getattr(self, "_tag_return", "window")
+        self.rebuild_current(keep_wid=wid)
 
     def cancel_tag(self):
         self.tag_target = None
         self.entry.set_text("")
-        self.rebuild_windows()
+        self.mode = getattr(self, "_tag_return", "window")
+        self.rebuild_current()
 
     # --- key handling --------------------------------------------------------
     def on_key(self, _w, event):
@@ -937,7 +1067,7 @@ class Switcher(Gtk.Window):
             self.hide_switcher()
             return True
         if key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
-            if ctrl and self.mode == "window":
+            if ctrl and self.mode in ("window", "ws"):
                 self.focus_selected()       # activate but keep the switcher up
             else:
                 self.on_activate()
@@ -949,9 +1079,18 @@ class Switcher(Gtk.Window):
             self.move_selection(1)
             return True
         if key in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):
+            # Cycle window -> workspaces -> drun; Shift+Tab (ISO_Left_Tab) back.
             self.entry.set_text("")
-            self.rebuild_windows(select_active=True) if self.mode == "drun" \
-                else self.rebuild_drun()
+            order = ["window", "ws", "drun"]
+            i = order.index(self.mode) if self.mode in order else 0
+            back = key == Gdk.KEY_ISO_Left_Tab or shift
+            nxt = order[(i + (-1 if back else 1)) % len(order)]
+            if nxt == "drun":
+                self.rebuild_drun()
+            elif nxt == "ws":
+                self.rebuild_ws(select_active=True)
+            else:
+                self.rebuild_windows(select_active=True)
             return True
         # Workspace switching works in both window and drun mode; the popup
         # grabs the keyboard, so the global binding can't reach it here.
@@ -962,7 +1101,7 @@ class Switcher(Gtk.Window):
             self.switch_ws(1)
             return True
 
-        if self.mode == "window":
+        if self.mode in ("window", "ws"):
             if key == Gdk.KEY_Delete:
                 self.close_selected()
                 return True
