@@ -680,7 +680,9 @@ class Switcher(Gtk.Window):
         wid = self.selected_wid()
         if not wid:
             return
-        target = (self.current_ws() + delta) % self.num_ws()
+        target = self.current_ws() + delta   # clamp, no wraparound
+        if target < 0 or target >= self.num_ws():
+            return
         w = self.wnck_window(wid)
         wsobj = self.screen.get_workspace(target)
         if w is not None and wsobj is not None:
