@@ -79,8 +79,9 @@ CSS = b"""
 }
 """
 
-HINT_WINDOW = ("<b>Del</b> close   <b>Alt+←/→</b> move ws   "
-               "<b>Alt+↑/↓</b> reorder   <b>Ctrl+Alt+←/→</b> switch ws   "
+HINT_WINDOW = ("<b>Ctrl+Enter</b> focus   <b>Del</b> close   "
+               "<b>Alt+←/→</b> move ws   <b>Alt+↑/↓</b> reorder   "
+               "<b>Ctrl+Alt+←/→</b> switch ws\n"
                "<b>Super+←/↑/→/↓</b> tile   <b>Super+Shift+←/→</b> monitor   "
                "<b>Ctrl+T</b> tag   <b>Tab</b> apps")
 HINT_DRUN = ("<b>Enter</b> launch   <b>Ctrl+Alt+←/→</b> switch ws   "
@@ -694,6 +695,28 @@ class Switcher(Gtk.Window):
             if w is not None:
                 w.activate(t)
 
+    def focus_selected(self):
+        # Activate the window but keep the switcher up, so the user can preview
+        # or cycle without dismissing. Activating moves input focus to the
+        # window and can break our seat grab, so raise the popup back above it
+        # and re-assert the keyboard grab once the activation has settled.
+        wid = self.selected_wid()
+        if not wid:
+            return
+        w = self.wnck_window(wid)
+        if w is None:
+            return
+        w.activate(self.server_time())
+
+        def reassert():
+            win = self.get_window()
+            if win is not None and self.get_mapped():
+                win.raise_()
+                self._grab_tries = 0
+                if self._try_grab():
+                    GLib.timeout_add(15, self._try_grab)
+        self.schedule(60, reassert)
+
     def launch_app(self, desktop_id):
         if GLib.find_program_in_path("gtk-launch"):
             subprocess.Popen(["gtk-launch", desktop_id])
@@ -900,7 +923,10 @@ class Switcher(Gtk.Window):
             self.hide_switcher()
             return True
         if key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
-            self.on_activate()
+            if ctrl and self.mode == "window":
+                self.focus_selected()       # activate but keep the switcher up
+            else:
+                self.on_activate()
             return True
         if key == Gdk.KEY_Up and not alt and not sup:
             self.move_selection(-1)

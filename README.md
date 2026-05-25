@@ -21,9 +21,11 @@ rofi-based window switcher with an always-resident equivalent.
   attached.
 - Built-in drun-style application launcher (Tab toggles it; Ctrl+R
   re-reads desktop files to pick up installed or removed apps).
-- Direct keyboard actions: Delete closes, Alt+Left/Right move a window
-  across workspaces, Ctrl+Alt+Left/Right switch workspace, Alt+Up/Down
-  reorder a slot, Ctrl+T edits a tag inline, F1-F12 jump to a slot.
+- Direct keyboard actions: Enter activates and dismisses, Ctrl+Enter
+  activates a window while leaving the switcher open, Delete closes,
+  Alt+Left/Right move a window across workspaces, Ctrl+Alt+Left/Right
+  switch workspace, Alt+Up/Down reorder a slot, Ctrl+T edits a tag
+  inline, F1-F12 jump to a slot.
 - Layout-mode actions mirroring GNOME: Super+Up maximizes, Super+Down
   floats, Super+Left/Right half-tiles, Super+Shift+Left/Right move the
   window to the previous or next monitor (clamped, not wrapped).
