@@ -51,7 +51,11 @@ DESKTOP_DIRS = [
 CSS = b"""
 /* Kill the theme's background/selection fade; rofi has no such animation. */
 #frofi, #frofi * { transition: none; }
-#frofi { background-color: #fdf6e3; border: 1px solid #002b36; font-family: monospace; }
+#frofi { background-color: #fdf6e3; font-family: monospace; }
+/* Frame on the inner box, not the window: a window border on an override-
+   redirect popup overlaps the content's edge pixels instead of reserving
+   space, which clipped the hint's top-border line and made it look narrow. */
+#frofi #frame { border: 1px solid #002b36; }
 #frofi .inputbar { background-color: #fdf6e3; padding: 0 12px; }
 #frofi entry {
     background-color: #fdf6e3; color: #002b36;
@@ -64,7 +68,11 @@ CSS = b"""
 #frofi .placeholder { color: #93a1a1; font-size: 12pt; }
 #frofi scrolledwindow { border-top: 2px dashed #002b36; }
 #frofi list { background-color: transparent; }
-#frofi row { padding: 1px 0; }
+#frofi row { padding: 1px 0; border: none; }
+/* Paint both parities from the row itself so their backgrounds share the
+   exact same box; leaving odd rows transparent let the container show through
+   a pixel wider on each side. */
+#frofi row:nth-child(odd) { background-color: #fdf6e3; }
 #frofi row:nth-child(even) { background-color: #eee8d5; }
 #frofi row label { color: #002b36; font-size: 12pt; }
 #frofi row:selected { background-color: #586875; }
@@ -75,7 +83,7 @@ CSS = b"""
 #frofi row:selected .mode { color: #eee8d5; }
 #frofi .hint {
     color: #586875; font-size: 9pt; padding: 6px 12px;
-    border-top: 1px solid #eee8d5;
+    border-top: 2px dashed #002b36;
 }
 """
 
@@ -193,6 +201,7 @@ class Switcher(Gtk.Window):
         self._row_h = None          # measured row height, for the 12-row viewport
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.set_name("frame")               # carries the 1px window frame border
         inputbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         inputbar.get_style_context().add_class("inputbar")
         self.prompt = Gtk.Label(xalign=0.0)
@@ -228,6 +237,7 @@ class Switcher(Gtk.Window):
         box.pack_start(scroller, True, True, 0)
 
         self.hint = Gtk.Label(xalign=0.0)
+        self.hint.set_halign(Gtk.Align.FILL)   # span full width, not just the text
         self.hint.get_style_context().add_class("hint")
         self.hint.set_use_markup(True)
         box.pack_start(self.hint, False, False, 0)
@@ -305,8 +315,8 @@ class Switcher(Gtk.Window):
         return None
 
     # --- row construction ----------------------------------------------------
-    def add_row(self, slot_text, mode_text, icon_name, markup, search,
-                selectable=True, **data):
+    def add_row(self, slot_text, mode_glyph, mode_digit, icon_name, markup,
+                search, selectable=True, **data):
         row = Gtk.ListBoxRow()
         row.search_text = search.lower()
         if not selectable:                  # empty slot placeholder; skip on nav
@@ -321,7 +331,8 @@ class Switcher(Gtk.Window):
         slot.set_width_chars(3)
         slot.get_style_context().add_class("slot")
         rb.pack_start(slot, False, False, 0)
-        mode = Gtk.Label(label=mode_text, xalign=0.0)
+        # Layout-mode glyph followed inline by the monitor digit (e.g. "◧2").
+        mode = Gtk.Label(label=mode_glyph + mode_digit, xalign=0.0)
         mode.set_width_chars(2)             # glyph plus an optional monitor digit
         mode.get_style_context().add_class("mode")
         rb.pack_start(mode, False, False, 0)
@@ -364,12 +375,12 @@ class Switcher(Gtk.Window):
         return rows, all_ids
 
     def window_indicator(self, geo, vmax, hmax):
-        """Glyph for the window's layout mode, plus a monitor digit.
+        """Return (mode glyph, monitor digit) for a window.
 
         GNOME's half-tile (Super+Left/Right) maximizes vertically but not
         horizontally and pins the window to one side, so vmax-without-hmax
         plus the center's x position distinguishes the two halves. The
-        monitor digit is shown only when more than one monitor is present.
+        monitor digit is non-empty only when more than one monitor is present.
         """
         gx, gy, gw, gh = geo
         cx, cy = gx + gw // 2, gy + gh // 2
@@ -386,7 +397,7 @@ class Switcher(Gtk.Window):
         else:
             glyph = MODE_GLYPHS["window"]
         digit = str(mi + 1) if len(self._monitors) > 1 and mi >= 0 else ""
-        return glyph + digit
+        return glyph, digit
 
     # --- slots (in-memory, per workspace) ------------------------------------
     def slots_for(self, ws):
@@ -452,10 +463,10 @@ class Switcher(Gtk.Window):
                 markup += f"  <span color='#8ab4f8'>[{pango(tag)}]</span>"
             slot_i = slot_of.get(wid)
             slot_text = f"F{slot_i + 1}" if slot_i is not None else ""
-            mode_text = self.window_indicator(geo, vmax, hmax)
+            glyph, digit = self.window_indicator(geo, vmax, hmax)
             search = title + " " + tag
             icon = self.icon_map.get(inst, inst)
-            return self.add_row(slot_text, mode_text, icon, markup, search,
+            return self.add_row(slot_text, glyph, digit, icon, markup, search,
                                 wid=wid)
 
         for i in range(12):                        # one fixed row per slot
@@ -467,7 +478,7 @@ class Switcher(Gtk.Window):
                 if active and int(wid, 16) == active:
                     active_row = r
             else:                                  # empty slot: blank placeholder
-                self.add_row(f"F{i + 1}", "", None, "", "", selectable=False)
+                self.add_row(f"F{i + 1}", "", "", None, "", "", selectable=False)
         for tup in win_rows:                       # any unslotted leftovers
             wid = tup[0]
             if wid not in slot_of:
@@ -494,8 +505,8 @@ class Switcher(Gtk.Window):
         self.hint.set_markup(HINT_DRUN)
         self.clear_rows()
         for app in self.apps:
-            self.add_row("", "", app["icon"], pango(app["name"]), app["name"],
-                         desktop_id=app["desktop_id"])
+            self.add_row("", "", "", app["icon"], pango(app["name"]),
+                         app["name"], desktop_id=app["desktop_id"])
         self.listbox.show_all()
         first = self.listbox.get_row_at_index(0)
         if first is not None:
