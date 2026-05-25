@@ -14,8 +14,8 @@ Set FROFI_DEBUG=1 to log show latency to stderr.
 
 Features:
   - Per-workspace list, active window preselected, type-to-filter.
-  - Stable F1-F12 slots in ~/.cache/frofi-slots-<ws> (holes on close,
-    lowest-empty reclaim).
+  - Stable F1-F12 slots, per workspace, held in memory for the daemon's
+    lifetime (holes on close, lowest-empty reclaim).
   - Tags in ~/.cache/frofi-tags, shown as [tag], dead entries pruned.
   - Delete close; Alt+Left/Right move window to prev/next workspace;
     Ctrl+Alt+Left/Right switch workspace; Alt+Up/Down reorder slot;
@@ -156,49 +156,6 @@ def parse_desktop_files():
     return icon_map, apps
 
 
-# --- slot persistence --------------------------------------------------------
-def slot_file(ws):
-    return os.path.join(CACHE, f"frofi-slots-{ws}")
-
-
-def read_slots(ws):
-    slots = [""] * 12
-    try:
-        with open(slot_file(ws)) as fh:
-            for i, line in enumerate(fh):
-                if i < 12:
-                    slots[i] = line.strip()
-    except OSError:
-        pass
-    return slots
-
-
-def write_slots(ws, slots):
-    os.makedirs(CACHE, exist_ok=True)
-    with open(slot_file(ws), "w") as fh:
-        fh.write("\n".join(slots[:12]) + "\n")
-
-
-def refresh_slots(ws, ordered_ids):
-    """Prune dead slots, fill empties with new windows; persist and return."""
-    slots = read_slots(ws)
-    cur = set(ordered_ids)
-    for i in range(12):
-        if slots[i] and slots[i] not in cur:
-            slots[i] = ""
-    in_slot = {s for s in slots if s}
-    for wid in ordered_ids:
-        if wid in in_slot:
-            continue
-        for i in range(12):
-            if not slots[i]:
-                slots[i] = wid
-                in_slot.add(wid)
-                break
-    write_slots(ws, slots)
-    return slots
-
-
 # --- tag persistence ---------------------------------------------------------
 def read_tags():
     tags = {}
@@ -233,7 +190,8 @@ class Switcher(Gtk.Window):
         self.icon_map, self.apps = parse_desktop_files()
         self._icon_cache = {}
         self.mode = "window"
-        self.slots = [""] * 12
+        self.slot_map = {}          # ws -> 12-element slot list (in-memory)
+        self.slots = [""] * 12      # current workspace's slots (view of above)
         self.tag_target = None      # wid being tagged in tag mode
         self._active_geo = None     # focused window geometry, for monitor pick
 
@@ -375,6 +333,32 @@ class Switcher(Gtk.Window):
                 rows.append((wid, inst, title, (gx, gy, gw, gh)))
         return rows, all_ids
 
+    # --- slots (in-memory, per workspace) ------------------------------------
+    def slots_for(self, ws):
+        return self.slot_map.setdefault(ws, [""] * 12)
+
+    def refresh_slots(self, ws, ordered_ids):
+        """Prune dead slots and fill empties from the live window list.
+
+        Mutates the workspace's slot list in place, so the assignment lives as
+        long as the daemon does. A daemon restart starts from empty slots.
+        """
+        slots = self.slots_for(ws)
+        cur = set(ordered_ids)
+        for i in range(12):
+            if slots[i] and slots[i] not in cur:
+                slots[i] = ""
+        in_slot = {s for s in slots if s}
+        for wid in ordered_ids:
+            if wid in in_slot:
+                continue
+            for i in range(12):
+                if not slots[i]:
+                    slots[i] = wid
+                    in_slot.add(wid)
+                    break
+        return slots
+
     def rebuild_windows(self, select_active=False, keep_wid=None):
         self.mode = "window"
         self.hint.set_markup(HINT_WINDOW)
@@ -382,7 +366,7 @@ class Switcher(Gtk.Window):
         ws = self.current_ws()
         win_rows, all_ids = self.list_windows(ws)
         ordered = [r[0] for r in win_rows]
-        self.slots = refresh_slots(ws, ordered)
+        self.slots = self.refresh_slots(ws, ordered)
 
         tags = read_tags()
         for wid in list(tags):                     # prune dead tags
@@ -644,14 +628,13 @@ class Switcher(Gtk.Window):
         if not wid:
             return
         ws = self.current_ws()
-        slots = read_slots(ws)
+        slots = self.slots_for(ws)
         if wid not in slots:
             return
         src = slots.index(wid)
         dst = src + delta
         if 0 <= dst <= 11:
             slots[src], slots[dst] = slots[dst], slots[src]
-            write_slots(ws, slots)
             self.rebuild_windows(keep_wid=wid)
 
     # --- inline tag editing --------------------------------------------------
@@ -769,7 +752,7 @@ def run_daemon():
         elif parts[0] == "focus-slot" and len(parts) == 2:
             ws = win.current_ws()
             _rows, _all = win.list_windows(ws)
-            slots = refresh_slots(ws, [r[0] for r in _rows])
+            slots = win.refresh_slots(ws, [r[0] for r in _rows])
             try:
                 n = int(parts[1])
             except ValueError:
