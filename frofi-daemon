@@ -709,7 +709,8 @@ class Switcher(Gtk.Window):
         wsobj = self.screen.get_workspace(target)
         if w is not None and wsobj is not None:
             w.move_to_workspace(wsobj)
-        self.schedule(90, lambda: self.rebuild_windows())
+            wsobj.activate(self.server_time())   # follow the window across
+        self.schedule(90, lambda: self.rebuild_windows(select_active=True))
 
     def switch_ws(self, delta):
         target = self.current_ws() + delta   # clamp, no wraparound
