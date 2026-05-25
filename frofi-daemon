@@ -31,8 +31,9 @@ import sys
 import time
 
 OWN_TITLE = "frofi-daemon-window"
-WIDTH, HEIGHT = 660, 460
+WIDTH = 660
 ICON_SIZE = 18
+VISIBLE_ROWS = 12       # list viewport height, in rows (matches the slot count)
 CACHE = os.path.expanduser("~/.cache")
 TAGS_FILE = os.path.join(CACHE, "frofi-tags")
 RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
@@ -192,7 +193,7 @@ class Switcher(Gtk.Window):
         super().__init__(type=Gtk.WindowType.POPUP)
         self.set_name("frofi")
         self.set_keep_above(True)
-        self.set_size_request(WIDTH, HEIGHT)
+        self.set_size_request(WIDTH, -1)    # height follows the 12-row viewport
 
         self.screen = Wnck.Screen.get_default()
         self.screen.force_update()   # populate the live window list once
@@ -203,6 +204,7 @@ class Switcher(Gtk.Window):
         self.slots = [""] * 12      # current workspace's slots (view of above)
         self.tag_target = None      # wid being tagged in tag mode
         self._active_geo = None     # focused window geometry, for monitor pick
+        self._row_h = None          # measured row height, for the 12-row viewport
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         inputbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
@@ -289,7 +291,9 @@ class Switcher(Gtk.Window):
     # --- icons ---------------------------------------------------------------
     def icon_image(self, name):
         if not name:
-            return Gtk.Image()
+            img = Gtk.Image()
+            img.set_size_request(ICON_SIZE, ICON_SIZE)   # keep row heights equal
+            return img
         if name in self._icon_cache:
             pb = self._icon_cache[name]
         else:
@@ -315,9 +319,12 @@ class Switcher(Gtk.Window):
         return None
 
     # --- row construction ----------------------------------------------------
-    def add_row(self, slot_text, icon_name, markup, search, **data):
+    def add_row(self, slot_text, icon_name, markup, search, selectable=True, **data):
         row = Gtk.ListBoxRow()
         row.search_text = search.lower()
+        if not selectable:                  # empty slot placeholder; skip on nav
+            row.set_selectable(False)
+            row.set_activatable(False)
         for k, v in data.items():
             setattr(row, k, v)
         rb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
@@ -425,7 +432,7 @@ class Switcher(Gtk.Window):
             icon = self.icon_map.get(inst, inst)
             return self.add_row(slot_text, icon, markup, search, wid=wid)
 
-        for i in range(12):                        # slotted windows, in order
+        for i in range(12):                        # one fixed row per slot
             wid = self.slots[i]
             if wid and wid in by_id:
                 r = emit(wid)
@@ -433,6 +440,8 @@ class Switcher(Gtk.Window):
                     keep_row = r
                 if active and int(wid, 16) == active:
                     active_row = r
+            else:                                  # empty slot: blank placeholder
+                self.add_row(f"F{i + 1}", None, "", "", selectable=False)
         for tup in win_rows:                       # any unslotted leftovers
             wid = tup[0]
             if wid not in slot_of:
@@ -443,8 +452,10 @@ class Switcher(Gtk.Window):
                     active_row = r
 
         self.listbox.show_all()
-        target = keep_row or (active_row if select_active else None) \
-            or self.listbox.get_row_at_index(0)
+        target = keep_row or (active_row if select_active else None)
+        if target is None:
+            vis = self.visible_rows()      # first real window row, not a slot gap
+            target = vis[0] if vis else None
         if target is not None:
             self.listbox.select_row(target)
             self.scroll_to(target)
@@ -475,10 +486,11 @@ class Switcher(Gtk.Window):
         if self.mode == "tag":
             return []
         q = self.entry.get_text().lower()
-        return [r for r in self.listbox.get_children() if q in r.search_text]
+        return [r for r in self.listbox.get_children()
+                if r.get_selectable() and q in r.search_text]
 
     def update_counter(self):
-        children = self.listbox.get_children()
+        children = [r for r in self.listbox.get_children() if r.get_selectable()]
         total = len(children)
         if self.mode == "tag":
             filtered = total
@@ -510,6 +522,22 @@ class Switcher(Gtk.Window):
         idx = max(0, min(len(vis) - 1, idx + delta))
         self.listbox.select_row(vis[idx])
         self.scroll_to(vis[idx])
+
+    def fit_height(self):
+        # Size the list viewport to exactly VISIBLE_ROWS rows. Row height depends
+        # on font, icon and padding, so measure a real row once and cache it.
+        if self._row_h is None:
+            row = self.listbox.get_row_at_index(0)
+            if row is None:
+                return
+            _min, nat = row.get_preferred_height()
+            self._row_h = nat or _min
+            if self._row_h <= 0:
+                self._row_h = None
+                return
+        h = self._row_h * VISIBLE_ROWS
+        self.scroller.set_min_content_height(h)
+        self.scroller.set_max_content_height(h)
 
     def scroll_to(self, row):
         def _do():
@@ -546,8 +574,9 @@ class Switcher(Gtk.Window):
     def center(self):
         display = Gdk.Display.get_default()
         geo = self.target_monitor(display).get_geometry()
+        _min, h = self.get_preferred_height()   # height follows the 12-row viewport
         self.move(geo.x + (geo.width - WIDTH) // 2,
-                  geo.y + (geo.height - HEIGHT) // 2)
+                  geo.y + (geo.height - h) // 2)
 
     def on_map(self, *_):
         # Super+Tab fires while the compositor still holds a grab on the Super
@@ -587,6 +616,7 @@ class Switcher(Gtk.Window):
         m0 = time.monotonic()
         self.entry.set_text("")
         self.rebuild_windows(select_active=True)
+        self.fit_height()          # lock the viewport to 12 rows before centering
         self.center()
         self.show_all()
         self._sync_placeholder()   # show_all forces it visible; correct it
