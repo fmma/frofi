@@ -48,23 +48,23 @@ DESKTOP_DIRS = [
 ]
 
 CSS = b"""
-#frofi { background-color: #1d1f21; border: 1px solid #3a3d41; }
+#frofi { background-color: #fdf6e3; border: 1px solid #002b36; font-family: monospace; }
 #frofi entry {
-    background-color: #1d1f21; color: #d8d8d8;
+    background-color: #fdf6e3; color: #002b36;
     border: none; box-shadow: none; border-radius: 0;
     padding: 10px 12px; font-size: 12pt;
 }
-#frofi entry:focus { border-bottom: 2px solid #3584e4; }
+#frofi entry:focus { border-bottom: 2px solid #268bd2; }
 #frofi list { background-color: transparent; }
 #frofi row { padding: 0; }
-#frofi row label { color: #d8d8d8; font-size: 11pt; }
-#frofi row:selected { background-color: #3584e4; }
-#frofi row:selected label { color: #ffffff; }
-#frofi .slot { color: #7f848a; font-family: monospace; }
-#frofi row:selected .slot { color: #cfe0ff; }
+#frofi row label { color: #002b36; font-size: 12pt; }
+#frofi row:selected { background-color: #586875; }
+#frofi row:selected label { color: #eee8d5; }
+#frofi .slot { color: #586875; font-family: monospace; }
+#frofi row:selected .slot { color: #eee8d5; }
 #frofi .hint {
-    color: #8a8f96; font-size: 9pt; padding: 6px 12px;
-    border-top: 1px solid #3a3d41;
+    color: #586875; font-size: 9pt; padding: 6px 12px;
+    border-top: 1px solid #eee8d5;
 }
 """
 
