@@ -32,7 +32,7 @@ import time
 
 OWN_TITLE = "frofi-daemon-window"
 WIDTH, HEIGHT = 660, 460
-ICON_SIZE = 28
+ICON_SIZE = 18
 CACHE = os.path.expanduser("~/.cache")
 TAGS_FILE = os.path.join(CACHE, "frofi-tags")
 RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
@@ -49,14 +49,20 @@ DESKTOP_DIRS = [
 
 CSS = b"""
 #frofi { background-color: #fdf6e3; border: 1px solid #002b36; font-family: monospace; }
+#frofi .inputbar { background-color: #fdf6e3; padding: 0 12px; }
 #frofi entry {
     background-color: #fdf6e3; color: #002b36;
+    caret-color: #002b36;
     border: none; box-shadow: none; border-radius: 0;
-    padding: 10px 12px; font-size: 12pt;
+    padding: 6px 0; font-size: 12pt;
 }
-#frofi entry:focus { border-bottom: 2px solid #268bd2; }
+#frofi .prompt { color: #002b36; font-size: 12pt; padding: 0 8px 0 0; }
+#frofi .counter { color: #586875; font-size: 12pt; padding: 0 0 0 8px; }
+#frofi .placeholder { color: #93a1a1; font-size: 12pt; }
+#frofi scrolledwindow { border-top: 2px dashed #002b36; }
 #frofi list { background-color: transparent; }
-#frofi row { padding: 0; }
+#frofi row { padding: 1px 0; }
+#frofi row:nth-child(even) { background-color: #eee8d5; }
 #frofi row label { color: #002b36; font-size: 12pt; }
 #frofi row:selected { background-color: #586875; }
 #frofi row:selected label { color: #eee8d5; }
@@ -71,7 +77,8 @@ CSS = b"""
 HINT_WINDOW = ("<b>Del</b> close   <b>Alt+←/→</b> move ws   "
                "<b>Alt+↑/↓</b> reorder   <b>Ctrl+Alt+←/→</b> "
                "switch ws   <b>Ctrl+T</b> tag   <b>Tab</b> apps")
-HINT_DRUN = "<b>Enter</b> launch   <b>Tab</b> windows"
+HINT_DRUN = ("<b>Enter</b> launch   <b>Ctrl+Alt+←/→</b> switch ws   "
+             "<b>Tab</b> windows")
 HINT_TAG = "<b>Enter</b> save tag   <b>Esc</b> cancel"
 
 
@@ -196,9 +203,30 @@ class Switcher(Gtk.Window):
         self._active_geo = None     # focused window geometry, for monitor pick
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        inputbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        inputbar.get_style_context().add_class("inputbar")
+        self.prompt = Gtk.Label(xalign=0.0)
+        self.prompt.get_style_context().add_class("prompt")
+        inputbar.pack_start(self.prompt, False, False, 0)
         self.entry = Gtk.Entry()
+        self.entry.set_has_frame(False)
         self.entry.connect("changed", self.on_filter_changed)
-        box.pack_start(self.entry, False, False, 0)
+        # GTK hides the entry's own placeholder text once it has focus, and the
+        # entry is always focused while the popup is up. Overlay our own label
+        # instead, toggled on text/mode in _sync_placeholder().
+        overlay = Gtk.Overlay()
+        overlay.add(self.entry)
+        self.placeholder = Gtk.Label(label="Type to filter", xalign=0.0)
+        self.placeholder.get_style_context().add_class("placeholder")
+        self.placeholder.set_halign(Gtk.Align.START)
+        self.placeholder.set_valign(Gtk.Align.CENTER)
+        overlay.add_overlay(self.placeholder)
+        overlay.set_overlay_pass_through(self.placeholder, True)
+        inputbar.pack_start(overlay, True, True, 0)
+        self.counter = Gtk.Label(xalign=1.0)
+        self.counter.get_style_context().add_class("counter")
+        inputbar.pack_start(self.counter, False, False, 0)
+        box.pack_start(inputbar, False, False, 0)
 
         scroller = Gtk.ScrolledWindow()
         self.scroller = scroller
@@ -290,8 +318,8 @@ class Switcher(Gtk.Window):
         row.search_text = search.lower()
         for k, v in data.items():
             setattr(row, k, v)
-        rb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        rb.set_margin_top(5); rb.set_margin_bottom(5)
+        rb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        rb.set_margin_top(2); rb.set_margin_bottom(2)
         rb.set_margin_start(12); rb.set_margin_end(12)
         slot = Gtk.Label(label=slot_text, xalign=0.0)
         slot.set_width_chars(3)
@@ -361,6 +389,7 @@ class Switcher(Gtk.Window):
 
     def rebuild_windows(self, select_active=False, keep_wid=None):
         self.mode = "window"
+        self.prompt.set_text("windows:")
         self.hint.set_markup(HINT_WINDOW)
         self.clear_rows()
         ws = self.current_ws()
@@ -417,10 +446,12 @@ class Switcher(Gtk.Window):
         if target is not None:
             self.listbox.select_row(target)
             self.scroll_to(target)
+        self.update_counter()
 
     # --- launcher list -------------------------------------------------------
     def rebuild_drun(self):
         self.mode = "drun"
+        self.prompt.set_text("drun:")
         self.hint.set_markup(HINT_DRUN)
         self.clear_rows()
         for app in self.apps:
@@ -430,6 +461,7 @@ class Switcher(Gtk.Window):
         first = self.listbox.get_row_at_index(0)
         if first is not None:
             self.listbox.select_row(first)
+        self.update_counter()
 
     # --- filtering / selection ----------------------------------------------
     def _filter(self, row):
@@ -443,13 +475,29 @@ class Switcher(Gtk.Window):
         q = self.entry.get_text().lower()
         return [r for r in self.listbox.get_children() if q in r.search_text]
 
+    def update_counter(self):
+        children = self.listbox.get_children()
+        total = len(children)
+        if self.mode == "tag":
+            filtered = total
+        else:
+            q = self.entry.get_text().lower()
+            filtered = sum(1 for r in children if q in r.search_text)
+        self.counter.set_text(f"{filtered}/{total}")
+
+    def _sync_placeholder(self):
+        self.placeholder.set_visible(
+            self.mode != "tag" and self.entry.get_text() == "")
+
     def on_filter_changed(self, _e):
+        self._sync_placeholder()
         if self.mode == "tag":
             return
         self.listbox.invalidate_filter()
         vis = self.visible_rows()
         if vis and self.listbox.get_selected_row() not in vis:
             self.listbox.select_row(vis[0])
+        self.update_counter()
 
     def move_selection(self, delta):
         vis = self.visible_rows()
@@ -539,6 +587,7 @@ class Switcher(Gtk.Window):
         self.rebuild_windows(select_active=True)
         self.center()
         self.show_all()
+        self._sync_placeholder()   # show_all forces it visible; correct it
         if DEBUG:
             render = (time.monotonic() - m0) * 1000
             if origin is not None:
@@ -617,11 +666,16 @@ class Switcher(Gtk.Window):
         self.schedule(90, lambda: self.rebuild_windows())
 
     def switch_ws(self, delta):
-        target = (self.current_ws() + delta) % self.num_ws()
+        target = self.current_ws() + delta   # clamp, no wraparound
+        if target < 0 or target >= self.num_ws():
+            return
         wsobj = self.screen.get_workspace(target)
         if wsobj is not None:
             wsobj.activate(self.server_time())
-        self.schedule(90, lambda: self.rebuild_windows(select_active=True))
+        # The launcher list is workspace-independent, so only refresh the
+        # window list (and stay in drun mode if that's where we are).
+        if self.mode == "window":
+            self.schedule(90, lambda: self.rebuild_windows(select_active=True))
 
     def reorder(self, delta):
         wid = self.selected_wid()
@@ -644,6 +698,7 @@ class Switcher(Gtk.Window):
             return
         self.tag_target = wid
         self.mode = "tag"
+        self.prompt.set_text("tag:")
         self.hint.set_markup(HINT_TAG)
         self.entry.set_text(read_tags().get(wid, ""))
         self.entry.grab_focus()
@@ -700,6 +755,14 @@ class Switcher(Gtk.Window):
             self.rebuild_windows(select_active=True) if self.mode == "drun" \
                 else self.rebuild_drun()
             return True
+        # Workspace switching works in both window and drun mode; the popup
+        # grabs the keyboard, so the global binding can't reach it here.
+        if ctrl and alt and key == Gdk.KEY_Left:
+            self.switch_ws(-1)
+            return True
+        if ctrl and alt and key == Gdk.KEY_Right:
+            self.switch_ws(1)
+            return True
 
         if self.mode == "window":
             if key == Gdk.KEY_Delete:
@@ -710,12 +773,6 @@ class Switcher(Gtk.Window):
                 return True
             if alt and not ctrl and key == Gdk.KEY_Right:
                 self.move_to_ws(1)
-                return True
-            if ctrl and alt and key == Gdk.KEY_Left:
-                self.switch_ws(-1)
-                return True
-            if ctrl and alt and key == Gdk.KEY_Right:
-                self.switch_ws(1)
                 return True
             if alt and key == Gdk.KEY_Up:
                 self.reorder(-1)
@@ -761,6 +818,17 @@ def run_daemon():
                 w = win.wnck_window(slots[n - 1])
                 if w is not None:
                     w.activate(win.server_time())
+        elif parts[0] == "switch-ws" and len(parts) == 2:
+            try:
+                delta = int(parts[1])
+            except ValueError:
+                return
+            target = win.current_ws() + delta   # clamp, no wraparound
+            if target < 0 or target >= win.num_ws():
+                return
+            wsobj = win.screen.get_workspace(target)
+            if wsobj is not None:
+                wsobj.activate(win.server_time())
 
     def on_incoming(_service, conn, _src):
         try:
