@@ -1,0 +1,806 @@
+#!/usr/bin/env python3
+"""frofi: a resident window switcher daemon for X11 / EWMH.
+
+A single long-running process owns all state (slots, tags, the icon/app maps)
+and renders an override-redirect GTK popup on demand. Override-redirect means
+mutter neither manages nor animates the window, so it appears instantly; an
+explicit keyboard grab gives it focus. Clients talk to it over a Unix socket:
+
+    frofi-daemon                 run the daemon
+    frofi-daemon --client show   show the switcher
+    frofi-daemon --client focus-slot N   jump to slot N (no UI)
+
+Set FROFI_DEBUG=1 to log show latency to stderr.
+
+Features:
+  - Per-workspace list, active window preselected, type-to-filter.
+  - Stable F1-F12 slots in ~/.cache/frofi-slots-<ws> (holes on close,
+    lowest-empty reclaim).
+  - Tags in ~/.cache/frofi-tags, shown as [tag], dead entries pruned.
+  - Delete close; Alt+Left/Right move window to prev/next workspace;
+    Ctrl+Alt+Left/Right switch workspace; Alt+Up/Down reorder slot;
+    Ctrl+T inline tag edit; F1-F12 jump to slot; Enter activate; Esc dismiss.
+  - Tab toggles a drun-style app launcher.
+"""
+import glob
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+OWN_TITLE = "frofi-daemon-window"
+WIDTH, HEIGHT = 660, 460
+ICON_SIZE = 28
+CACHE = os.path.expanduser("~/.cache")
+TAGS_FILE = os.path.join(CACHE, "frofi-tags")
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+SOCK_PATH = os.path.join(RUNTIME, "frofi.sock")
+DEBUG = bool(os.environ.get("FROFI_DEBUG"))
+
+DESKTOP_DIRS = [
+    "/usr/share/applications",
+    "/usr/local/share/applications",
+    os.path.expanduser("~/.local/share/applications"),
+    "/var/lib/snapd/desktop/applications",
+    "/var/lib/flatpak/exports/share/applications",
+]
+
+CSS = b"""
+#frofi { background-color: #1d1f21; border: 1px solid #3a3d41; }
+#frofi entry {
+    background-color: #1d1f21; color: #d8d8d8;
+    border: none; box-shadow: none; border-radius: 0;
+    padding: 10px 12px; font-size: 12pt;
+}
+#frofi entry:focus { border-bottom: 2px solid #3584e4; }
+#frofi list { background-color: transparent; }
+#frofi row { padding: 0; }
+#frofi row label { color: #d8d8d8; font-size: 11pt; }
+#frofi row:selected { background-color: #3584e4; }
+#frofi row:selected label { color: #ffffff; }
+#frofi .slot { color: #7f848a; font-family: monospace; }
+#frofi row:selected .slot { color: #cfe0ff; }
+#frofi .hint {
+    color: #8a8f96; font-size: 9pt; padding: 6px 12px;
+    border-top: 1px solid #3a3d41;
+}
+"""
+
+HINT_WINDOW = ("<b>Del</b> close   <b>Alt+←/→</b> move ws   "
+               "<b>Alt+↑/↓</b> reorder   <b>Ctrl+Alt+←/→</b> "
+               "switch ws   <b>Ctrl+T</b> tag   <b>Tab</b> apps")
+HINT_DRUN = "<b>Enter</b> launch   <b>Tab</b> windows"
+HINT_TAG = "<b>Enter</b> save tag   <b>Esc</b> cancel"
+
+
+# --- client ------------------------------------------------------------------
+# The client just sends one line over the socket. It runs on every Super+Tab,
+# so it must stay lightweight: handle it here, before importing gi/GTK/Wnck
+# (that import alone costs ~150 ms of process startup).
+def run_client(args):
+    cmd = " ".join(args) if args else "show"
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(SOCK_PATH)
+    except OSError:
+        sys.exit(1)          # daemon not running; wrapper handles startup
+    s.sendall((cmd + "\n").encode())
+    s.close()
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "--client":
+    run_client(sys.argv[2:])
+    sys.exit(0)
+
+
+# --- daemon (heavy imports below this line) ----------------------------------
+import gi  # noqa: E402
+gi.require_version("Gtk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("GdkX11", "3.0")
+gi.require_version("Wnck", "3.0")
+from gi.repository import Gtk, Gdk, GdkPixbuf, GdkX11, GLib, Gio, Wnck  # noqa: E402
+
+
+# --- helpers -----------------------------------------------------------------
+def wid_str(window):
+    # Zero-padded X window id, matching wmctrl/xprop conventions.
+    return "0x%08x" % window.get_xid()
+
+
+def pango(s):
+    return GLib.markup_escape_text(s)
+
+
+# --- desktop file parsing ----------------------------------------------------
+def parse_desktop_files():
+    """Return (icon_map, apps).
+
+    icon_map: lower(StartupWMClass) -> Icon, for matching live windows.
+    apps: list of dicts {name, icon, desktop_id} for the launcher (drun).
+    """
+    icon_map = {}
+    apps = []
+    seen = set()
+    for d in DESKTOP_DIRS:
+        for path in sorted(glob.glob(os.path.join(d, "*.desktop"))):
+            desktop_id = os.path.basename(path)
+            if desktop_id in seen:
+                continue
+            section = None
+            vals = {}
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        line = line.rstrip("\n")
+                        if line.startswith("["):
+                            section = line[1:-1] if line.endswith("]") else line[1:]
+                        elif section == "Desktop Entry" and "=" in line:
+                            k, v = line.split("=", 1)
+                            if k not in vals:
+                                vals[k] = v
+            except OSError:
+                continue
+            seen.add(desktop_id)
+            wmclass, icon = vals.get("StartupWMClass"), vals.get("Icon")
+            if wmclass and icon:
+                icon_map[wmclass.lower()] = icon
+            if (vals.get("Type") == "Application"
+                    and vals.get("NoDisplay", "false").lower() != "true"
+                    and vals.get("Name") and vals.get("Exec")):
+                apps.append({"name": vals["Name"], "icon": icon or "",
+                             "desktop_id": desktop_id})
+    apps.sort(key=lambda a: a["name"].lower())
+    return icon_map, apps
+
+
+# --- slot persistence --------------------------------------------------------
+def slot_file(ws):
+    return os.path.join(CACHE, f"frofi-slots-{ws}")
+
+
+def read_slots(ws):
+    slots = [""] * 12
+    try:
+        with open(slot_file(ws)) as fh:
+            for i, line in enumerate(fh):
+                if i < 12:
+                    slots[i] = line.strip()
+    except OSError:
+        pass
+    return slots
+
+
+def write_slots(ws, slots):
+    os.makedirs(CACHE, exist_ok=True)
+    with open(slot_file(ws), "w") as fh:
+        fh.write("\n".join(slots[:12]) + "\n")
+
+
+def refresh_slots(ws, ordered_ids):
+    """Prune dead slots, fill empties with new windows; persist and return."""
+    slots = read_slots(ws)
+    cur = set(ordered_ids)
+    for i in range(12):
+        if slots[i] and slots[i] not in cur:
+            slots[i] = ""
+    in_slot = {s for s in slots if s}
+    for wid in ordered_ids:
+        if wid in in_slot:
+            continue
+        for i in range(12):
+            if not slots[i]:
+                slots[i] = wid
+                in_slot.add(wid)
+                break
+    write_slots(ws, slots)
+    return slots
+
+
+# --- tag persistence ---------------------------------------------------------
+def read_tags():
+    tags = {}
+    try:
+        with open(TAGS_FILE) as fh:
+            for line in fh:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) == 2 and parts[0] and parts[1]:
+                    tags[parts[0]] = parts[1]
+    except OSError:
+        pass
+    return tags
+
+
+def write_tags(tags):
+    os.makedirs(CACHE, exist_ok=True)
+    with open(TAGS_FILE, "w") as fh:
+        for wid, tag in tags.items():
+            if tag:
+                fh.write(f"{wid}\t{tag}\n")
+
+
+class Switcher(Gtk.Window):
+    def __init__(self):
+        super().__init__(type=Gtk.WindowType.POPUP)
+        self.set_name("frofi")
+        self.set_keep_above(True)
+        self.set_size_request(WIDTH, HEIGHT)
+
+        self.screen = Wnck.Screen.get_default()
+        self.screen.force_update()   # populate the live window list once
+        self.icon_map, self.apps = parse_desktop_files()
+        self._icon_cache = {}
+        self.mode = "window"
+        self.slots = [""] * 12
+        self.tag_target = None      # wid being tagged in tag mode
+        self._active_geo = None     # focused window geometry, for monitor pick
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.entry = Gtk.Entry()
+        self.entry.connect("changed", self.on_filter_changed)
+        box.pack_start(self.entry, False, False, 0)
+
+        scroller = Gtk.ScrolledWindow()
+        self.scroller = scroller
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_activate_on_single_click(False)
+        self.listbox.set_filter_func(self._filter)
+        scroller.add(self.listbox)
+        box.pack_start(scroller, True, True, 0)
+
+        self.hint = Gtk.Label(xalign=0.0)
+        self.hint.get_style_context().add_class("hint")
+        self.hint.set_use_markup(True)
+        box.pack_start(self.hint, False, False, 0)
+        self.add(box)
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        self.connect("key-press-event", self.on_key)
+        self.connect("map-event", self.on_map)
+        self.listbox.connect("row-activated", lambda _b, _r: self.on_activate())
+        self.realize()
+
+    # --- live X queries (Wnck, no subprocess) --------------------------------
+    def current_ws(self):
+        ws = self.screen.get_active_workspace()
+        return ws.get_number() if ws is not None else 0
+
+    def num_ws(self):
+        return max(1, self.screen.get_workspace_count())
+
+    def active_xid(self):
+        w = self.screen.get_active_window()
+        return w.get_xid() if w is not None else None
+
+    def wnck_window(self, wid):
+        target = int(wid, 16)
+        for w in self.screen.get_windows():
+            if w.get_xid() == target:
+                return w
+        return None
+
+    def server_time(self):
+        # A current X server timestamp keeps mutter's focus-stealing
+        # prevention from rejecting activate/close. One round-trip, sub-ms.
+        win = self.get_window()
+        if win is not None:
+            try:
+                return GdkX11.x11_get_server_time(win)
+            except Exception:
+                pass
+        return Gtk.get_current_event_time()
+
+    # --- icons ---------------------------------------------------------------
+    def icon_image(self, name):
+        if not name:
+            return Gtk.Image()
+        if name in self._icon_cache:
+            pb = self._icon_cache[name]
+        else:
+            pb = self._load_icon(name)
+            self._icon_cache[name] = pb
+        img = Gtk.Image.new_from_pixbuf(pb) if pb else Gtk.Image()
+        img.set_size_request(ICON_SIZE, ICON_SIZE)
+        return img
+
+    def _load_icon(self, name):
+        try:
+            if os.path.isabs(name) and os.path.exists(name):
+                return GdkPixbuf.Pixbuf.new_from_file_at_size(name, ICON_SIZE, ICON_SIZE)
+            theme = Gtk.IconTheme.get_default()
+            if theme.has_icon(name):
+                return theme.load_icon(name, ICON_SIZE, Gtk.IconLookupFlags.FORCE_SIZE)
+            for ext in ("png", "svg", "xpm"):
+                p = f"/usr/share/pixmaps/{name}.{ext}"
+                if os.path.exists(p):
+                    return GdkPixbuf.Pixbuf.new_from_file_at_size(p, ICON_SIZE, ICON_SIZE)
+        except Exception:
+            pass
+        return None
+
+    # --- row construction ----------------------------------------------------
+    def add_row(self, slot_text, icon_name, markup, search, **data):
+        row = Gtk.ListBoxRow()
+        row.search_text = search.lower()
+        for k, v in data.items():
+            setattr(row, k, v)
+        rb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        rb.set_margin_top(5); rb.set_margin_bottom(5)
+        rb.set_margin_start(12); rb.set_margin_end(12)
+        slot = Gtk.Label(label=slot_text, xalign=0.0)
+        slot.set_width_chars(3)
+        slot.get_style_context().add_class("slot")
+        rb.pack_start(slot, False, False, 0)
+        rb.pack_start(self.icon_image(icon_name), False, False, 0)
+        lbl = Gtk.Label(xalign=0.0)
+        lbl.set_markup(markup)
+        lbl.set_ellipsize(3)
+        rb.pack_start(lbl, True, True, 0)
+        row.add(rb)
+        self.listbox.add(row)
+        return row
+
+    def clear_rows(self):
+        for child in self.listbox.get_children():
+            self.listbox.remove(child)
+
+    # --- window list ---------------------------------------------------------
+    def list_windows(self, ws):
+        """Return (ordered current-ws rows, all live wids).
+
+        Reads the live Wnck window list (kept current via X events), so it
+        spawns nothing. Rows are (wid, instance, title, geometry).
+        """
+        rows, all_ids = [], []
+        for w in self.screen.get_windows():
+            if w.is_skip_tasklist():
+                continue
+            title = w.get_name() or ""
+            if title == OWN_TITLE:
+                continue
+            wid = wid_str(w)
+            all_ids.append(wid)
+            wsobj = w.get_workspace()
+            if wsobj is not None and wsobj.get_number() == ws:
+                gx, gy, gw, gh = w.get_geometry()
+                inst = (w.get_class_instance_name() or "").lower()
+                rows.append((wid, inst, title, (gx, gy, gw, gh)))
+        return rows, all_ids
+
+    def rebuild_windows(self, select_active=False, keep_wid=None):
+        self.mode = "window"
+        self.hint.set_markup(HINT_WINDOW)
+        self.clear_rows()
+        ws = self.current_ws()
+        win_rows, all_ids = self.list_windows(ws)
+        ordered = [r[0] for r in win_rows]
+        self.slots = refresh_slots(ws, ordered)
+
+        tags = read_tags()
+        for wid in list(tags):                     # prune dead tags
+            if wid not in all_ids:
+                del tags[wid]
+        write_tags(tags)
+
+        by_id = {r[0]: r for r in win_rows}
+        slot_of = {wid: i for i, wid in enumerate(self.slots) if wid}
+        active = self.active_xid()
+        self._active_geo = None
+        active_row = keep_row = None
+
+        def emit(wid):
+            inst, title, geo = by_id[wid][1], by_id[wid][2], by_id[wid][3]
+            if active and int(wid, 16) == active:
+                self._active_geo = geo
+            tag = tags.get(wid, "")
+            markup = pango(title)
+            if tag:
+                markup += f"  <span color='#8ab4f8'>[{pango(tag)}]</span>"
+            slot_i = slot_of.get(wid)
+            slot_text = f"F{slot_i + 1}" if slot_i is not None else ""
+            search = title + " " + tag
+            icon = self.icon_map.get(inst, inst)
+            return self.add_row(slot_text, icon, markup, search, wid=wid)
+
+        for i in range(12):                        # slotted windows, in order
+            wid = self.slots[i]
+            if wid and wid in by_id:
+                r = emit(wid)
+                if wid == keep_wid:
+                    keep_row = r
+                if active and int(wid, 16) == active:
+                    active_row = r
+        for tup in win_rows:                       # any unslotted leftovers
+            wid = tup[0]
+            if wid not in slot_of:
+                r = emit(wid)
+                if wid == keep_wid:
+                    keep_row = r
+                if active and int(wid, 16) == active:
+                    active_row = r
+
+        self.listbox.show_all()
+        target = keep_row or (active_row if select_active else None) \
+            or self.listbox.get_row_at_index(0)
+        if target is not None:
+            self.listbox.select_row(target)
+            self.scroll_to(target)
+
+    # --- launcher list -------------------------------------------------------
+    def rebuild_drun(self):
+        self.mode = "drun"
+        self.hint.set_markup(HINT_DRUN)
+        self.clear_rows()
+        for app in self.apps:
+            self.add_row("", app["icon"], pango(app["name"]), app["name"],
+                         desktop_id=app["desktop_id"])
+        self.listbox.show_all()
+        first = self.listbox.get_row_at_index(0)
+        if first is not None:
+            self.listbox.select_row(first)
+
+    # --- filtering / selection ----------------------------------------------
+    def _filter(self, row):
+        if self.mode == "tag":
+            return True
+        return self.entry.get_text().lower() in row.search_text
+
+    def visible_rows(self):
+        if self.mode == "tag":
+            return []
+        q = self.entry.get_text().lower()
+        return [r for r in self.listbox.get_children() if q in r.search_text]
+
+    def on_filter_changed(self, _e):
+        if self.mode == "tag":
+            return
+        self.listbox.invalidate_filter()
+        vis = self.visible_rows()
+        if vis and self.listbox.get_selected_row() not in vis:
+            self.listbox.select_row(vis[0])
+
+    def move_selection(self, delta):
+        vis = self.visible_rows()
+        if not vis:
+            return
+        cur = self.listbox.get_selected_row()
+        idx = vis.index(cur) if cur in vis else 0
+        idx = max(0, min(len(vis) - 1, idx + delta))
+        self.listbox.select_row(vis[idx])
+        self.scroll_to(vis[idx])
+
+    def scroll_to(self, row):
+        def _do():
+            alloc = row.get_allocation()
+            adj = self.scroller.get_vadjustment()
+            if adj is None:
+                return False
+            top, bottom = alloc.y, alloc.y + alloc.height
+            if top < adj.get_value():
+                adj.set_value(top)
+            elif bottom > adj.get_value() + adj.get_page_size():
+                adj.set_value(bottom - adj.get_page_size())
+            return False
+        GLib.idle_add(_do)
+
+    # --- show / hide ---------------------------------------------------------
+    def target_monitor(self, display):
+        # Monitor of the focused window (matches rofi's default), then the
+        # pointer's monitor, then primary. The active window's geometry was
+        # cached during rebuild_windows, so this needs no extra subprocess.
+        if self._active_geo:
+            x, y, w, h = self._active_geo
+            m = display.get_monitor_at_point(x + w // 2, y + h // 2)
+            if m is not None:
+                return m
+        pointer = display.get_default_seat().get_pointer()
+        if pointer is not None:
+            _s, px, py = pointer.get_position()
+            m = display.get_monitor_at_point(px, py)
+            if m is not None:
+                return m
+        return display.get_primary_monitor() or display.get_monitor(0)
+
+    def center(self):
+        display = Gdk.Display.get_default()
+        geo = self.target_monitor(display).get_geometry()
+        self.move(geo.x + (geo.width - WIDTH) // 2,
+                  geo.y + (geo.height - HEIGHT) // 2)
+
+    def on_map(self, *_):
+        # Super+Tab fires while the compositor still holds a grab on the Super
+        # modifier, so the first grab attempt often returns ALREADY_GRABBED (or
+        # NOT_VIEWABLE if the window isn't up yet). Without the grab this
+        # override-redirect popup gets no keyboard input and can't be
+        # dismissed. Retry until it succeeds (typically once the keys release).
+        self._grab_tries = 0
+        self._grabbed = False
+        if self._try_grab():
+            GLib.timeout_add(15, self._try_grab)
+        return False
+
+    def _try_grab(self):
+        if not self.get_mapped():
+            return False            # window gone; stop retrying
+        win = self.get_window()
+        if win is None:
+            return False
+        seat = win.get_display().get_default_seat()
+        status = seat.grab(win, Gdk.SeatCapabilities.KEYBOARD,
+                           True, None, None, None)
+        if status == Gdk.GrabStatus.SUCCESS:
+            self._grabbed = True
+            self.entry.grab_focus()
+            return False            # got it; stop retrying
+        self._grab_tries += 1
+        if self._grab_tries >= 80:  # ~1.2s elapsed, give up to avoid spinning
+            print(f"frofi: keyboard grab failed ({status.value_nick}); "
+                  "hiding", file=sys.stderr, flush=True)
+            self.hide_switcher()    # don't leave an unusable popup on screen
+            return False
+        return True                 # keep retrying on the timeout
+
+    def show_switcher(self, origin=None):
+        recv = time.time()         # realtime, comparable to the wrapper's t0
+        m0 = time.monotonic()
+        self.entry.set_text("")
+        self.rebuild_windows(select_active=True)
+        self.center()
+        self.show_all()
+        if DEBUG:
+            render = (time.monotonic() - m0) * 1000
+            if origin is not None:
+                ipc = (recv - origin) * 1000   # wrapper t0 -> daemon handling
+                print(f"frofi: e2e {ipc + render:.1f} ms "
+                      f"(ipc {ipc:.1f} + render {render:.1f})",
+                      file=sys.stderr, flush=True)
+            else:
+                print(f"frofi: render {render:.1f} ms",
+                      file=sys.stderr, flush=True)
+
+    def hide_switcher(self):
+        win = self.get_window()
+        if win is not None:
+            win.get_display().get_default_seat().ungrab()
+        self.mode = "window"
+        self.tag_target = None
+        self.hide()
+
+    def schedule(self, ms, fn):
+        GLib.timeout_add(ms, lambda: (fn(), False)[1])
+
+    # --- actions -------------------------------------------------------------
+    def selected_wid(self):
+        row = self.listbox.get_selected_row()
+        return getattr(row, "wid", None) if row else None
+
+    def on_activate(self):
+        if self.mode == "drun":
+            row = self.listbox.get_selected_row()
+            self.hide_switcher()
+            if row is not None:
+                self.launch_app(row.desktop_id)
+            return
+        wid = self.selected_wid()
+        t = self.server_time()
+        self.hide_switcher()
+        if wid:
+            w = self.wnck_window(wid)
+            if w is not None:
+                w.activate(t)
+
+    def launch_app(self, desktop_id):
+        if GLib.find_program_in_path("gtk-launch"):
+            subprocess.Popen(["gtk-launch", desktop_id])
+        else:
+            subprocess.Popen(["gio", "launch",
+                              os.path.join(DESKTOP_DIRS[0], desktop_id)])
+
+    def jump_slot(self, n):
+        if 1 <= n <= 12 and self.slots[n - 1]:
+            wid = self.slots[n - 1]
+            t = self.server_time()
+            self.hide_switcher()
+            w = self.wnck_window(wid)
+            if w is not None:
+                w.activate(t)
+
+    def close_selected(self):
+        wid = self.selected_wid()
+        if wid:
+            w = self.wnck_window(wid)
+            if w is not None:
+                w.close(self.server_time())
+            self.schedule(90, lambda: self.rebuild_windows())
+
+    def move_to_ws(self, delta):
+        wid = self.selected_wid()
+        if not wid:
+            return
+        target = (self.current_ws() + delta) % self.num_ws()
+        w = self.wnck_window(wid)
+        wsobj = self.screen.get_workspace(target)
+        if w is not None and wsobj is not None:
+            w.move_to_workspace(wsobj)
+        self.schedule(90, lambda: self.rebuild_windows())
+
+    def switch_ws(self, delta):
+        target = (self.current_ws() + delta) % self.num_ws()
+        wsobj = self.screen.get_workspace(target)
+        if wsobj is not None:
+            wsobj.activate(self.server_time())
+        self.schedule(90, lambda: self.rebuild_windows(select_active=True))
+
+    def reorder(self, delta):
+        wid = self.selected_wid()
+        if not wid:
+            return
+        ws = self.current_ws()
+        slots = read_slots(ws)
+        if wid not in slots:
+            return
+        src = slots.index(wid)
+        dst = src + delta
+        if 0 <= dst <= 11:
+            slots[src], slots[dst] = slots[dst], slots[src]
+            write_slots(ws, slots)
+            self.rebuild_windows(keep_wid=wid)
+
+    # --- inline tag editing --------------------------------------------------
+    def begin_tag(self):
+        wid = self.selected_wid()
+        if not wid:
+            return
+        self.tag_target = wid
+        self.mode = "tag"
+        self.hint.set_markup(HINT_TAG)
+        self.entry.set_text(read_tags().get(wid, ""))
+        self.entry.grab_focus()
+
+    def commit_tag(self):
+        tags = read_tags()
+        tag = self.entry.get_text().strip()
+        if tag:
+            tags[self.tag_target] = tag
+        else:
+            tags.pop(self.tag_target, None)
+        write_tags(tags)
+        wid = self.tag_target
+        self.tag_target = None
+        self.entry.set_text("")
+        self.rebuild_windows(keep_wid=wid)
+
+    def cancel_tag(self):
+        self.tag_target = None
+        self.entry.set_text("")
+        self.rebuild_windows()
+
+    # --- key handling --------------------------------------------------------
+    def on_key(self, _w, event):
+        key = event.keyval
+        mods = event.state & (Gdk.ModifierType.CONTROL_MASK
+                              | Gdk.ModifierType.MOD1_MASK)
+        ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
+        alt = bool(mods & Gdk.ModifierType.MOD1_MASK)
+
+        if self.mode == "tag":
+            if key == Gdk.KEY_Escape:
+                self.cancel_tag()
+                return True
+            if key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+                self.commit_tag()
+                return True
+            return False
+
+        if key == Gdk.KEY_Escape:
+            self.hide_switcher()
+            return True
+        if key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self.on_activate()
+            return True
+        if key == Gdk.KEY_Up and not alt:
+            self.move_selection(-1)
+            return True
+        if key == Gdk.KEY_Down and not alt:
+            self.move_selection(1)
+            return True
+        if key in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):
+            self.entry.set_text("")
+            self.rebuild_windows(select_active=True) if self.mode == "drun" \
+                else self.rebuild_drun()
+            return True
+
+        if self.mode == "window":
+            if key == Gdk.KEY_Delete:
+                self.close_selected()
+                return True
+            if alt and not ctrl and key == Gdk.KEY_Left:
+                self.move_to_ws(-1)
+                return True
+            if alt and not ctrl and key == Gdk.KEY_Right:
+                self.move_to_ws(1)
+                return True
+            if ctrl and alt and key == Gdk.KEY_Left:
+                self.switch_ws(-1)
+                return True
+            if ctrl and alt and key == Gdk.KEY_Right:
+                self.switch_ws(1)
+                return True
+            if alt and key == Gdk.KEY_Up:
+                self.reorder(-1)
+                return True
+            if alt and key == Gdk.KEY_Down:
+                self.reorder(1)
+                return True
+            if ctrl and key in (Gdk.KEY_t, Gdk.KEY_T):
+                self.begin_tag()
+                return True
+            if Gdk.KEY_F1 <= key <= Gdk.KEY_F12:
+                self.jump_slot(key - Gdk.KEY_F1 + 1)
+                return True
+
+        return False  # printable keys fall through to the filter entry
+
+
+# --- IPC ---------------------------------------------------------------------
+def run_daemon():
+    win = Switcher()
+
+    def dispatch(cmd):
+        parts = cmd.split()
+        if not parts:
+            return
+        if parts[0] == "show":
+            origin = None
+            if len(parts) > 1:
+                try:
+                    origin = float(parts[1])
+                except ValueError:
+                    pass
+            win.show_switcher(origin)
+        elif parts[0] == "focus-slot" and len(parts) == 2:
+            ws = win.current_ws()
+            _rows, _all = win.list_windows(ws)
+            slots = refresh_slots(ws, [r[0] for r in _rows])
+            try:
+                n = int(parts[1])
+            except ValueError:
+                return
+            if 1 <= n <= 12 and slots[n - 1]:
+                w = win.wnck_window(slots[n - 1])
+                if w is not None:
+                    w.activate(win.server_time())
+
+    def on_incoming(_service, conn, _src):
+        try:
+            data = conn.get_input_stream().read_bytes(256, None).get_data()
+            GLib.idle_add(lambda: (dispatch(data.decode().strip()), False)[1])
+        except Exception:
+            pass
+        return False
+
+    if os.path.exists(SOCK_PATH):
+        os.unlink(SOCK_PATH)
+    service = Gio.SocketService.new()
+    service.add_address(Gio.UnixSocketAddress.new(SOCK_PATH),
+                        Gio.SocketType.STREAM, Gio.SocketProtocol.DEFAULT, None)
+    service.connect("incoming", on_incoming)
+    service.start()
+
+    # SIGUSR1 kept as a fallback "show" trigger.
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1,
+                         lambda: (win.show_switcher(), True)[1])
+    print(f"frofi-daemon ready (pid {os.getpid()})", file=sys.stderr, flush=True)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    run_daemon()   # --client is handled above, before the gi import
