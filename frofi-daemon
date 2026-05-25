@@ -381,6 +381,9 @@ class Switcher(Gtk.Window):
         self.hint.set_markup(HINT_WINDOW)
         self.clear_rows()
         ws = self.current_ws()
+        nws = self.num_ws()
+        for k in [k for k in self.slot_map if k >= nws]:   # drop removed ws
+            del self.slot_map[k]
         win_rows, all_ids = self.list_windows(ws)
         ordered = [r[0] for r in win_rows]
         self.slots = self.refresh_slots(ws, ordered)
