@@ -16,7 +16,7 @@ Features:
   - Per-workspace list, active window preselected, type-to-filter.
   - Stable F1-F12 slots, per workspace, held in memory for the daemon's
     lifetime (holes on close, lowest-empty reclaim).
-  - Tags in ~/.cache/frofi-tags, shown as [tag], dead entries pruned.
+  - Per-window tags held in memory, shown as [tag], dead entries pruned.
   - Delete close; Alt+Left/Right move window to prev/next workspace;
     Ctrl+Alt+Left/Right switch workspace; Alt+Up/Down reorder slot;
     Ctrl+T inline tag edit; F1-F12 jump to slot; Enter activate; Esc dismiss.
@@ -34,8 +34,6 @@ OWN_TITLE = "frofi-daemon-window"
 WIDTH = 660
 ICON_SIZE = 18
 VISIBLE_ROWS = 12       # list viewport height, in rows (matches the slot count)
-CACHE = os.path.expanduser("~/.cache")
-TAGS_FILE = os.path.join(CACHE, "frofi-tags")
 RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
 SOCK_PATH = os.path.join(RUNTIME, "frofi.sock")
 DEBUG = bool(os.environ.get("FROFI_DEBUG"))
@@ -166,28 +164,6 @@ def parse_desktop_files():
     return icon_map, apps
 
 
-# --- tag persistence ---------------------------------------------------------
-def read_tags():
-    tags = {}
-    try:
-        with open(TAGS_FILE) as fh:
-            for line in fh:
-                parts = line.rstrip("\n").split("\t")
-                if len(parts) == 2 and parts[0] and parts[1]:
-                    tags[parts[0]] = parts[1]
-    except OSError:
-        pass
-    return tags
-
-
-def write_tags(tags):
-    os.makedirs(CACHE, exist_ok=True)
-    with open(TAGS_FILE, "w") as fh:
-        for wid, tag in tags.items():
-            if tag:
-                fh.write(f"{wid}\t{tag}\n")
-
-
 class Switcher(Gtk.Window):
     def __init__(self):
         super().__init__(type=Gtk.WindowType.POPUP)
@@ -202,6 +178,7 @@ class Switcher(Gtk.Window):
         self.mode = "window"
         self.slot_map = {}          # ws -> 12-element slot list (in-memory)
         self.slots = [""] * 12      # current workspace's slots (view of above)
+        self.tags = {}              # wid -> tag, in-memory for the daemon's life
         self.tag_target = None      # wid being tagged in tag mode
         self._active_geo = None     # focused window geometry, for monitor pick
         self._row_h = None          # measured row height, for the 12-row viewport
@@ -406,11 +383,10 @@ class Switcher(Gtk.Window):
         ordered = [r[0] for r in win_rows]
         self.slots = self.refresh_slots(ws, ordered)
 
-        tags = read_tags()
-        for wid in list(tags):                     # prune dead tags
+        tags = self.tags
+        for wid in list(tags):                     # prune tags for dead windows
             if wid not in all_ids:
                 del tags[wid]
-        write_tags(tags)
 
         by_id = {r[0]: r for r in win_rows}
         slot_of = {wid: i for i, wid in enumerate(self.slots) if wid}
@@ -747,17 +723,15 @@ class Switcher(Gtk.Window):
         self.mode = "tag"
         self.prompt.set_text("tag:")
         self.hint.set_markup(HINT_TAG)
-        self.entry.set_text(read_tags().get(wid, ""))
+        self.entry.set_text(self.tags.get(wid, ""))
         self.entry.grab_focus()
 
     def commit_tag(self):
-        tags = read_tags()
         tag = self.entry.get_text().strip()
         if tag:
-            tags[self.tag_target] = tag
+            self.tags[self.tag_target] = tag
         else:
-            tags.pop(self.tag_target, None)
-        write_tags(tags)
+            self.tags.pop(self.tag_target, None)
         wid = self.tag_target
         self.tag_target = None
         self.entry.set_text("")

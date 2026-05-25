@@ -14,7 +14,8 @@ rofi-based window switcher with an always-resident equivalent.
 - Stable F1-F12 slots, per workspace, held in memory for the daemon's
   lifetime; slots keep their holes when a window closes and reclaim the
   lowest empty index. A daemon restart starts from empty slots.
-- Per-window tags in `~/.cache/frofi-tags`, shown inline as `[tag]`.
+- Per-window tags held in memory for the daemon's lifetime, shown
+  inline as `[tag]`.
 - Built-in drun-style application launcher (Tab toggles it).
 - Direct keyboard actions: Delete closes, Alt+Left/Right move a window
   across workspaces, Ctrl+Alt+Left/Right switch workspace, Alt+Up/Down
