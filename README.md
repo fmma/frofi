@@ -16,6 +16,9 @@ rofi-based window switcher with an always-resident equivalent.
   lowest empty index. A daemon restart starts from empty slots.
 - Per-window tags held in memory for the daemon's lifetime, shown
   inline as `[tag]`.
+- Layout-mode glyph per row: `□` floating, `■` maximized, `◧`/`◨` left
+  or right half-tile, with the monitor number when more than one is
+  attached.
 - Built-in drun-style application launcher (Tab toggles it; Ctrl+R
   re-reads desktop files to pick up installed or removed apps).
 - Direct keyboard actions: Delete closes, Alt+Left/Right move a window

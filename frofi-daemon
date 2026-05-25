@@ -71,6 +71,8 @@ CSS = b"""
 #frofi row:selected label { color: #eee8d5; }
 #frofi .slot { color: #586875; font-family: monospace; }
 #frofi row:selected .slot { color: #eee8d5; }
+#frofi .mode { color: #586875; font-family: monospace; }
+#frofi row:selected .mode { color: #eee8d5; }
 #frofi .hint {
     color: #586875; font-size: 9pt; padding: 6px 12px;
     border-top: 1px solid #eee8d5;
@@ -83,6 +85,9 @@ HINT_WINDOW = ("<b>Del</b> close   <b>Alt+←/→</b> move ws   "
 HINT_DRUN = ("<b>Enter</b> launch   <b>Ctrl+Alt+←/→</b> switch ws   "
              "<b>Ctrl+R</b> refresh   <b>Tab</b> windows")
 HINT_TAG = "<b>Enter</b> save tag   <b>Esc</b> cancel"
+
+# Layout-mode glyphs: floating window, maximized, left half, right half.
+MODE_GLYPHS = {"window": "□", "max": "■", "left": "◧", "right": "◨"}
 
 
 # --- client ------------------------------------------------------------------
@@ -298,7 +303,8 @@ class Switcher(Gtk.Window):
         return None
 
     # --- row construction ----------------------------------------------------
-    def add_row(self, slot_text, icon_name, markup, search, selectable=True, **data):
+    def add_row(self, slot_text, mode_text, icon_name, markup, search,
+                selectable=True, **data):
         row = Gtk.ListBoxRow()
         row.search_text = search.lower()
         if not selectable:                  # empty slot placeholder; skip on nav
@@ -313,6 +319,10 @@ class Switcher(Gtk.Window):
         slot.set_width_chars(3)
         slot.get_style_context().add_class("slot")
         rb.pack_start(slot, False, False, 0)
+        mode = Gtk.Label(label=mode_text, xalign=0.0)
+        mode.set_width_chars(2)             # glyph plus an optional monitor digit
+        mode.get_style_context().add_class("mode")
+        rb.pack_start(mode, False, False, 0)
         rb.pack_start(self.icon_image(icon_name), False, False, 0)
         lbl = Gtk.Label(xalign=0.0)
         lbl.set_markup(markup)
@@ -331,7 +341,7 @@ class Switcher(Gtk.Window):
         """Return (ordered current-ws rows, all live wids).
 
         Reads the live Wnck window list (kept current via X events), so it
-        spawns nothing. Rows are (wid, instance, title, geometry).
+        spawns nothing. Rows are (wid, instance, title, geometry, vmax, hmax).
         """
         rows, all_ids = [], []
         for w in self.screen.get_windows():
@@ -346,8 +356,35 @@ class Switcher(Gtk.Window):
             if wsobj is not None and wsobj.get_number() == ws:
                 gx, gy, gw, gh = w.get_geometry()
                 inst = (w.get_class_instance_name() or "").lower()
-                rows.append((wid, inst, title, (gx, gy, gw, gh)))
+                rows.append((wid, inst, title, (gx, gy, gw, gh),
+                             w.is_maximized_vertically(),
+                             w.is_maximized_horizontally()))
         return rows, all_ids
+
+    def window_indicator(self, geo, vmax, hmax):
+        """Glyph for the window's layout mode, plus a monitor digit.
+
+        GNOME's half-tile (Super+Left/Right) maximizes vertically but not
+        horizontally and pins the window to one side, so vmax-without-hmax
+        plus the center's x position distinguishes the two halves. The
+        monitor digit is shown only when more than one monitor is present.
+        """
+        gx, gy, gw, gh = geo
+        cx, cy = gx + gw // 2, gy + gh // 2
+        mi, mgeo = -1, None
+        for i, g in enumerate(self._monitors):
+            if g.x <= cx < g.x + g.width and g.y <= cy < g.y + g.height:
+                mi, mgeo = i, g
+                break
+        if vmax and hmax:
+            glyph = MODE_GLYPHS["max"]
+        elif vmax and not hmax and mgeo is not None:
+            glyph = (MODE_GLYPHS["left"] if cx < mgeo.x + mgeo.width // 2
+                     else MODE_GLYPHS["right"])
+        else:
+            glyph = MODE_GLYPHS["window"]
+        digit = str(mi + 1) if len(self._monitors) > 1 and mi >= 0 else ""
+        return glyph + digit
 
     # --- slots (in-memory, per workspace) ------------------------------------
     def slots_for(self, ws):
@@ -384,6 +421,9 @@ class Switcher(Gtk.Window):
         nws = self.num_ws()
         for k in [k for k in self.slot_map if k >= nws]:   # drop removed ws
             del self.slot_map[k]
+        disp = Gdk.Display.get_default()
+        self._monitors = [disp.get_monitor(i).get_geometry()
+                          for i in range(disp.get_n_monitors())]
         win_rows, all_ids = self.list_windows(ws)
         ordered = [r[0] for r in win_rows]
         self.slots = self.refresh_slots(ws, ordered)
@@ -400,7 +440,8 @@ class Switcher(Gtk.Window):
         active_row = keep_row = None
 
         def emit(wid):
-            inst, title, geo = by_id[wid][1], by_id[wid][2], by_id[wid][3]
+            rec = by_id[wid]
+            inst, title, geo, vmax, hmax = rec[1], rec[2], rec[3], rec[4], rec[5]
             if active and int(wid, 16) == active:
                 self._active_geo = geo
             tag = tags.get(wid, "")
@@ -409,9 +450,11 @@ class Switcher(Gtk.Window):
                 markup += f"  <span color='#8ab4f8'>[{pango(tag)}]</span>"
             slot_i = slot_of.get(wid)
             slot_text = f"F{slot_i + 1}" if slot_i is not None else ""
+            mode_text = self.window_indicator(geo, vmax, hmax)
             search = title + " " + tag
             icon = self.icon_map.get(inst, inst)
-            return self.add_row(slot_text, icon, markup, search, wid=wid)
+            return self.add_row(slot_text, mode_text, icon, markup, search,
+                                wid=wid)
 
         for i in range(12):                        # one fixed row per slot
             wid = self.slots[i]
@@ -422,7 +465,7 @@ class Switcher(Gtk.Window):
                 if active and int(wid, 16) == active:
                     active_row = r
             else:                                  # empty slot: blank placeholder
-                self.add_row(f"F{i + 1}", None, "", "", selectable=False)
+                self.add_row(f"F{i + 1}", "", None, "", "", selectable=False)
         for tup in win_rows:                       # any unslotted leftovers
             wid = tup[0]
             if wid not in slot_of:
@@ -449,7 +492,7 @@ class Switcher(Gtk.Window):
         self.hint.set_markup(HINT_DRUN)
         self.clear_rows()
         for app in self.apps:
-            self.add_row("", app["icon"], pango(app["name"]), app["name"],
+            self.add_row("", "", app["icon"], pango(app["name"]), app["name"],
                          desktop_id=app["desktop_id"])
         self.listbox.show_all()
         first = self.listbox.get_row_at_index(0)
