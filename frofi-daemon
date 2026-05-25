@@ -22,6 +22,7 @@ Features:
     Ctrl+T inline tag edit; F1-F12 jump to slot; Enter activate; Esc dismiss.
   - Tab toggles a drun-style app launcher.
 """
+import fcntl
 import glob
 import os
 import signal
@@ -36,6 +37,7 @@ ICON_SIZE = 18
 VISIBLE_ROWS = 12       # list viewport height, in rows (matches the slot count)
 RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
 SOCK_PATH = os.path.join(RUNTIME, "frofi.sock")
+LOCK_PATH = os.path.join(RUNTIME, "frofi.lock")
 DEBUG = bool(os.environ.get("FROFI_DEBUG"))
 
 DESKTOP_DIRS = [
@@ -867,23 +869,52 @@ def run_daemon():
 
     def on_incoming(_service, conn, _src):
         try:
+            # Commands are short single lines (e.g. "focus-slot 3"); one read of
+            # 256 bytes covers them. The wrapper never pipelines requests.
             data = conn.get_input_stream().read_bytes(256, None).get_data()
             GLib.idle_add(lambda: (dispatch(data.decode().strip()), False)[1])
         except Exception:
             pass
+        finally:
+            conn.close()
         return False
+
+    # Guard against a second daemon: hold an exclusive lock for our lifetime.
+    # The wrapper's "send first, then start" ordering already makes this rare,
+    # but the lock closes the race where two daemons start at once and the
+    # second unlinks the first's live socket. flock releases automatically on
+    # exit, so a crashed daemon leaves no stale lock.
+    lock_fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("frofi-daemon already running; exiting", file=sys.stderr, flush=True)
+        sys.exit(0)
 
     if os.path.exists(SOCK_PATH):
         os.unlink(SOCK_PATH)
     service = Gio.SocketService.new()
     service.add_address(Gio.UnixSocketAddress.new(SOCK_PATH),
                         Gio.SocketType.STREAM, Gio.SocketProtocol.DEFAULT, None)
+    # The socket drives window actions; restrict it to the owning user even
+    # when it falls back to a world-traversable /tmp (XDG_RUNTIME_DIR unset).
+    os.chmod(SOCK_PATH, 0o600)
     service.connect("incoming", on_incoming)
     service.start()
+
+    def shutdown():
+        try:
+            os.unlink(SOCK_PATH)
+        except OSError:
+            pass
+        Gtk.main_quit()
+        return False
 
     # SIGUSR1 kept as a fallback "show" trigger.
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1,
                          lambda: (win.show_switcher(), True)[1])
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, shutdown)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, shutdown)
     print(f"frofi-daemon ready (pid {os.getpid()})", file=sys.stderr, flush=True)
     Gtk.main()
 
