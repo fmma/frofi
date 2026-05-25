@@ -24,6 +24,9 @@ rofi-based window switcher with an always-resident equivalent.
 - Direct keyboard actions: Delete closes, Alt+Left/Right move a window
   across workspaces, Ctrl+Alt+Left/Right switch workspace, Alt+Up/Down
   reorder a slot, Ctrl+T edits a tag inline, F1-F12 jump to a slot.
+- Layout-mode actions mirroring GNOME: Super+Up maximizes, Super+Down
+  floats, Super+Left/Right half-tiles, Super+Shift+Left/Right move the
+  window to the previous or next monitor (clamped, not wrapped).
 
 ## How it works
 

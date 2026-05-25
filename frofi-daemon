@@ -80,8 +80,9 @@ CSS = b"""
 """
 
 HINT_WINDOW = ("<b>Del</b> close   <b>Alt+←/→</b> move ws   "
-               "<b>Alt+↑/↓</b> reorder   <b>Ctrl+Alt+←/→</b> "
-               "switch ws   <b>Ctrl+T</b> tag   <b>Tab</b> apps")
+               "<b>Alt+↑/↓</b> reorder   <b>Ctrl+Alt+←/→</b> switch ws   "
+               "<b>Super+←/↑/→/↓</b> tile   <b>Super+Shift+←/→</b> monitor   "
+               "<b>Ctrl+T</b> tag   <b>Tab</b> apps")
 HINT_DRUN = ("<b>Enter</b> launch   <b>Ctrl+Alt+←/→</b> switch ws   "
              "<b>Ctrl+R</b> refresh   <b>Tab</b> windows")
 HINT_TAG = "<b>Enter</b> save tag   <b>Esc</b> cancel"
@@ -757,6 +758,79 @@ class Switcher(Gtk.Window):
         if self.mode == "window":
             self.schedule(90, lambda: self.rebuild_windows(select_active=True))
 
+    # --- window layout (mirrors GNOME's Super+arrow tiling) ------------------
+    def _monitor_at(self, x, y):
+        disp = Gdk.Display.get_default()
+        for i in range(disp.get_n_monitors()):
+            g = disp.get_monitor(i).get_geometry()
+            if g.x <= x < g.x + g.width and g.y <= y < g.y + g.height:
+                return i, disp.get_monitor(i)
+        return 0, disp.get_monitor(0)
+
+    def _move_resize(self, w, x, y, width, height):
+        mask = (Wnck.WindowMoveResizeMask.X | Wnck.WindowMoveResizeMask.Y
+                | Wnck.WindowMoveResizeMask.WIDTH | Wnck.WindowMoveResizeMask.HEIGHT)
+        w.set_geometry(Wnck.WindowGravity.STATIC, mask, x, y, width, height)
+
+    def _tile(self, w, area, side):
+        # GNOME's half-tile is a vertically-maximized, half-width window pinned
+        # to one side. Reproduce it: clear maximize, place the half, re-max vert.
+        half = area.width // 2
+        x = area.x if side == "left" else area.x + half
+        w.unmaximize()
+        self._move_resize(w, x, area.y, half, area.height)
+        w.maximize_vertically()
+
+    def set_window_mode(self, mode):
+        wid = self.selected_wid()
+        if not wid:
+            return
+        w = self.wnck_window(wid)
+        if w is None:
+            return
+        gx, gy, gw, gh = w.get_geometry()
+        if mode == "max":
+            w.unmaximize()
+            w.maximize()
+        elif mode == "window":
+            w.unmaximize()
+        else:                                   # "left" / "right"
+            _i, mon = self._monitor_at(gx + gw // 2, gy + gh // 2)
+            self._tile(w, mon.get_workarea(), mode)
+        self.schedule(90, lambda: self.rebuild_windows(keep_wid=wid))
+
+    def move_to_monitor(self, delta):
+        wid = self.selected_wid()
+        if not wid:
+            return
+        w = self.wnck_window(wid)
+        if w is None:
+            return
+        disp = Gdk.Display.get_default()
+        n = disp.get_n_monitors()
+        gx, gy, gw, gh = w.get_geometry()
+        cur, cmon = self._monitor_at(gx + gw // 2, gy + gh // 2)
+        target = cur + delta                    # clamp, no wraparound
+        if target < 0 or target >= n:
+            return
+        cgeo = cmon.get_geometry()
+        darea = disp.get_monitor(target).get_workarea()
+        vmax, hmax = w.is_maximized_vertically(), w.is_maximized_horizontally()
+        if vmax and hmax:                        # keep maximized on the new mon
+            w.unmaximize()
+            self._move_resize(w, darea.x, darea.y, darea.width, darea.height)
+            w.maximize()
+        elif vmax and not hmax:                  # keep the same half on new mon
+            side = "left" if gx + gw // 2 < cgeo.x + cgeo.width // 2 else "right"
+            self._tile(w, darea, side)
+        else:                                    # floating: same relative offset
+            nx = darea.x + (gx - cgeo.x)
+            ny = darea.y + (gy - cgeo.y)
+            nx = max(darea.x, min(nx, darea.x + darea.width - gw))
+            ny = max(darea.y, min(ny, darea.y + darea.height - gh))
+            self._move_resize(w, nx, ny, gw, gh)
+        self.schedule(90, lambda: self.rebuild_windows(keep_wid=wid))
+
     def reorder(self, delta):
         wid = self.selected_wid()
         if not wid:
@@ -803,9 +877,15 @@ class Switcher(Gtk.Window):
     def on_key(self, _w, event):
         key = event.keyval
         mods = event.state & (Gdk.ModifierType.CONTROL_MASK
-                              | Gdk.ModifierType.MOD1_MASK)
+                              | Gdk.ModifierType.MOD1_MASK
+                              | Gdk.ModifierType.SHIFT_MASK
+                              | Gdk.ModifierType.SUPER_MASK
+                              | Gdk.ModifierType.MOD4_MASK)
         ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
         alt = bool(mods & Gdk.ModifierType.MOD1_MASK)
+        shift = bool(mods & Gdk.ModifierType.SHIFT_MASK)
+        sup = bool(mods & (Gdk.ModifierType.SUPER_MASK
+                           | Gdk.ModifierType.MOD4_MASK))
 
         if self.mode == "tag":
             if key == Gdk.KEY_Escape:
@@ -822,10 +902,10 @@ class Switcher(Gtk.Window):
         if key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
             self.on_activate()
             return True
-        if key == Gdk.KEY_Up and not alt:
+        if key == Gdk.KEY_Up and not alt and not sup:
             self.move_selection(-1)
             return True
-        if key == Gdk.KEY_Down and not alt:
+        if key == Gdk.KEY_Down and not alt and not sup:
             self.move_selection(1)
             return True
         if key in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):
@@ -860,6 +940,24 @@ class Switcher(Gtk.Window):
                 return True
             if ctrl and key in (Gdk.KEY_t, Gdk.KEY_T):
                 self.begin_tag()
+                return True
+            if sup and shift and key == Gdk.KEY_Left:
+                self.move_to_monitor(-1)
+                return True
+            if sup and shift and key == Gdk.KEY_Right:
+                self.move_to_monitor(1)
+                return True
+            if sup and not shift and key == Gdk.KEY_Left:
+                self.set_window_mode("left")
+                return True
+            if sup and not shift and key == Gdk.KEY_Right:
+                self.set_window_mode("right")
+                return True
+            if sup and not shift and key == Gdk.KEY_Up:
+                self.set_window_mode("max")
+                return True
+            if sup and not shift and key == Gdk.KEY_Down:
+                self.set_window_mode("window")
                 return True
             if Gdk.KEY_F1 <= key <= Gdk.KEY_F12:
                 self.jump_slot(key - Gdk.KEY_F1 + 1)
