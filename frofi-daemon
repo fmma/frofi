@@ -48,6 +48,8 @@ DESKTOP_DIRS = [
 ]
 
 CSS = b"""
+/* Kill the theme's background/selection fade; rofi has no such animation. */
+#frofi, #frofi * { transition: none; }
 #frofi { background-color: #fdf6e3; border: 1px solid #002b36; font-family: monospace; }
 #frofi .inputbar { background-color: #fdf6e3; padding: 0 12px; }
 #frofi entry {
