@@ -79,7 +79,7 @@ HINT_WINDOW = ("<b>Del</b> close   <b>Alt+←/→</b> move ws   "
                "<b>Alt+↑/↓</b> reorder   <b>Ctrl+Alt+←/→</b> "
                "switch ws   <b>Ctrl+T</b> tag   <b>Tab</b> apps")
 HINT_DRUN = ("<b>Enter</b> launch   <b>Ctrl+Alt+←/→</b> switch ws   "
-             "<b>Tab</b> windows")
+             "<b>Ctrl+R</b> refresh   <b>Tab</b> windows")
 HINT_TAG = "<b>Enter</b> save tag   <b>Esc</b> cancel"
 
 
@@ -452,6 +452,13 @@ class Switcher(Gtk.Window):
             self.listbox.select_row(first)
         self.update_counter()
 
+    def refresh_apps(self):
+        # Desktop files are parsed once at startup; re-read them so apps
+        # installed or removed since then show up without a daemon restart.
+        self.icon_map, self.apps = parse_desktop_files()
+        self.entry.set_text("")
+        self.rebuild_drun()
+
     # --- filtering / selection ----------------------------------------------
     def _filter(self, row):
         if self.mode == "tag":
@@ -808,6 +815,11 @@ class Switcher(Gtk.Window):
                 return True
             if Gdk.KEY_F1 <= key <= Gdk.KEY_F12:
                 self.jump_slot(key - Gdk.KEY_F1 + 1)
+                return True
+
+        if self.mode == "drun":
+            if ctrl and key in (Gdk.KEY_r, Gdk.KEY_R):
+                self.refresh_apps()
                 return True
 
         return False  # printable keys fall through to the filter entry
