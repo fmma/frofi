@@ -20,11 +20,13 @@ Features:
   - Delete close; Alt+Left/Right move window to prev/next workspace;
     Ctrl+Alt+Left/Right switch workspace; Alt+Up/Down reorder slot;
     Ctrl+T inline tag edit; F1-F12 jump to slot; Enter activate; Esc dismiss.
-  - Tab toggles a drun-style app launcher.
+  - Tab cycles window list -> workspaces -> drun launcher -> help.
+  - Help lists the GNOME custom shortcuts usable outside frofi.
 """
 import fcntl
 import glob
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -108,6 +110,7 @@ HINT_WS = ("<b>Ctrl+Enter</b> focus   <b>Del</b> close   "
            "<b>Ctrl+F</b> F-keys   <b>Tab</b> cycle")
 HINT_DRUN = ("<b>Enter</b> launch   <b>Ctrl+Alt+←/→</b> switch ws   "
              "<b>Ctrl+R</b> refresh   <b>Tab</b> cycle")
+HINT_HELP = "<b>Tab</b> cycle   <b>Esc</b> close   GNOME custom shortcuts (read-only)"
 HINT_TAG = "<b>Enter</b> save tag   <b>Esc</b> cancel"
 
 # Layout-mode glyphs: floating window, maximized, left half, right half.
@@ -154,6 +157,24 @@ def wid_str(window):
 
 def pango(s):
     return GLib.markup_escape_text(s)
+
+
+# Modifier and key aliases for rendering a GNOME accelerator string (e.g.
+# "<Primary><Alt>l") as a readable combo ("Ctrl+Alt+L"). <Primary> is GNOME's
+# portable alias for Control; Mod4 is Super.
+_MOD_NAMES = {"Primary": "Ctrl", "Control": "Ctrl", "Ctrl": "Ctrl",
+              "Alt": "Alt", "Shift": "Shift", "Super": "Super", "Mod4": "Super"}
+_KEY_NAMES = {"space": "Space", "Page_Up": "Page Up", "Page_Down": "Page Down",
+              "Prior": "Page Up", "Next": "Page Down", "Return": "Enter"}
+
+
+def prettify_binding(binding):
+    mods = [_MOD_NAMES.get(t, t) for t in re.findall(r"<([^>]+)>", binding)]
+    key = re.sub(r"<[^>]+>", "", binding)
+    key = _KEY_NAMES.get(key, key)
+    if len(key) == 1:                       # single letters like 'l', 'b'
+        key = key.upper()
+    return "+".join(mods + [key]) if key else "+".join(mods)
 
 
 # --- desktop file parsing ----------------------------------------------------
@@ -665,6 +686,48 @@ class Switcher(Gtk.Window):
         self.entry.set_text("")
         self.rebuild_drun()
 
+    # --- help (GNOME custom keybindings) -------------------------------------
+    def custom_keybindings(self):
+        """Read GNOME's Custom Shortcuts: list of (binding, name).
+
+        These are the user's global shortcuts (gnome-control-center's "Custom
+        Shortcuts"), the ones usable from anywhere in GNOME while frofi is not
+        focused. Read live each time help opens so it tracks the config; the
+        relocatable custom-keybinding schema holds name/binding/command per
+        entry, listed by path in the media-keys schema.
+        """
+        base = "org.gnome.settings-daemon.plugins.media-keys"
+        try:
+            top = Gio.Settings.new(base)
+        except Exception:
+            return []
+        schema = base + ".custom-keybinding"
+        out = []
+        for path in top.get_strv("custom-keybindings"):
+            entry = Gio.Settings.new_with_path(schema, path)
+            binding = entry.get_string("binding")
+            if binding:
+                out.append((binding, entry.get_string("name")))
+        return out
+
+    def rebuild_help(self):
+        # A read-only reference listing each global custom shortcut as
+        # "<combo>   name". No window/launcher actions apply here, so rows just
+        # support type-to-filter; Tab cycles on, Esc closes.
+        self.mode = "help"
+        self.prompt.set_text("help:")
+        self.hint.set_markup(HINT_HELP)
+        self.clear_rows()
+        for binding, name in self.custom_keybindings():
+            combo = prettify_binding(binding)
+            markup = f"<b>{pango(combo)}</b>   {pango(name)}"
+            self.add_row("", "", "", None, markup, f"{combo} {name}")
+        self.listbox.show_all()
+        first = self.listbox.get_row_at_index(0)
+        if first is not None:
+            self.listbox.select_row(first)
+        self.update_counter()
+
     # --- filtering / selection ----------------------------------------------
     def _filter(self, row):
         if self.mode == "tag":
@@ -1113,9 +1176,9 @@ class Switcher(Gtk.Window):
             self.move_selection(1)
             return True
         if key in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):
-            # Cycle window -> workspaces -> drun; Shift+Tab (ISO_Left_Tab) back.
+            # Cycle window -> workspaces -> drun -> help; Shift+Tab back.
             self.entry.set_text("")
-            order = ["window", "ws", "drun"]
+            order = ["window", "ws", "drun", "help"]
             i = order.index(self.mode) if self.mode in order else 0
             back = key == Gdk.KEY_ISO_Left_Tab or shift
             nxt = order[(i + (-1 if back else 1)) % len(order)]
@@ -1123,6 +1186,8 @@ class Switcher(Gtk.Window):
                 self.rebuild_drun()
             elif nxt == "ws":
                 self.rebuild_ws(select_active=True)
+            elif nxt == "help":
+                self.rebuild_help()
             else:
                 self.rebuild_windows(select_active=True)
             return True
