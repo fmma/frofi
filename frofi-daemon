@@ -1181,6 +1181,12 @@ class Switcher(Gtk.Window):
         if key == Gdk.KEY_Down and not alt and not sup and not shift:
             self.move_selection(1)
             return True
+        if key == Gdk.KEY_Page_Up and not alt and not sup and not shift:
+            self.move_selection(-(VISIBLE_ROWS - 1))
+            return True
+        if key == Gdk.KEY_Page_Down and not alt and not sup and not shift:
+            self.move_selection(VISIBLE_ROWS - 1)
+            return True
         if key in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):
             # Cycle window -> workspaces -> drun -> help; Shift+Tab back.
             self.entry.set_text("")
