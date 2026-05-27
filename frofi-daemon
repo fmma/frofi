@@ -90,18 +90,22 @@ CSS = b"""
     color: #586875; font-size: 9pt; padding: 6px 12px;
     border-top: 2px dashed #002b36;
 }
+#frofi .status { color: #586875; font-size: 10pt; padding: 4px 12px; }
+#frofi .status.off { color: #b58900; }
 """
 
 HINT_WINDOW = ("<b>Ctrl+Enter</b> focus   <b>Del</b> close   "
                "<b>Alt+←/→</b> move ws   <b>Alt+↑/↓</b> reorder   "
                "<b>Ctrl+Alt+←/→</b> switch ws\n"
-               "<b>Super+←/↑/→/↓</b> tile   <b>Super+Shift+←/→</b> monitor   "
-               "<b>Ctrl+T</b> tag   <b>Tab</b> cycle")
+               "<b>←/→</b> tile   <b>Shift+↑/↓</b> max/float   "
+               "<b>Shift+←/→</b> monitor   <b>Ctrl+T</b> tag   "
+               "<b>Ctrl+F</b> F-keys   <b>Tab</b> cycle")
 HINT_WS = ("<b>Ctrl+Enter</b> focus   <b>Del</b> close   "
            "<b>Alt+←/→</b> move ws   <b>Alt+↑/↓</b> reorder   "
            "<b>Ctrl+Alt+←/→</b> switch ws\n"
-           "<b>Super+←/↑/→/↓</b> tile   <b>Super+Shift+←/→</b> monitor   "
-           "<b>Ctrl+T</b> tag   <b>Tab</b> cycle")
+           "<b>←/→</b> tile   <b>Shift+↑/↓</b> max/float   "
+           "<b>Shift+←/→</b> monitor   <b>Ctrl+T</b> tag   "
+           "<b>Ctrl+F</b> F-keys   <b>Tab</b> cycle")
 HINT_DRUN = ("<b>Enter</b> launch   <b>Ctrl+Alt+←/→</b> switch ws   "
              "<b>Ctrl+R</b> refresh   <b>Tab</b> cycle")
 HINT_TAG = "<b>Enter</b> save tag   <b>Esc</b> cancel"
@@ -240,6 +244,12 @@ class Switcher(Gtk.Window):
         self.counter.get_style_context().add_class("counter")
         inputbar.pack_start(self.counter, False, False, 0)
         box.pack_start(inputbar, False, False, 0)
+
+        # Its own line: reflects the fkeys-toggle state (Super+f inside frofi).
+        self.status = Gtk.Label(xalign=0.0)
+        self.status.set_halign(Gtk.Align.FILL)
+        self.status.get_style_context().add_class("status")
+        box.pack_start(self.status, False, False, 0)
 
         scroller = Gtk.ScrolledWindow()
         self.scroller = scroller
@@ -543,6 +553,29 @@ class Switcher(Gtk.Window):
             self.scroll_to(target)
         self.update_counter()
 
+    def fkeys_off(self):
+        # The fkeys-toggle helper writes 'on'/'off' here; absent means on.
+        try:
+            with open(os.path.join(RUNTIME, "frofi-fkeys")) as f:
+                return f.read().strip() == "off"
+        except OSError:
+            return False
+
+    def refresh_status(self):
+        off = self.fkeys_off()
+        ctx = self.status.get_style_context()
+        if off:
+            ctx.add_class("off")
+            self.status.set_text("F-keys off — F1-F12 pass through to apps")
+        else:
+            ctx.remove_class("off")
+            self.status.set_text("F-keys on — F1-F12 jump to slots")
+
+    def toggle_fkeys(self):
+        subprocess.run([os.path.expanduser("~/.local/bin/fkeys-toggle")],
+                       check=False)
+        self.refresh_status()
+
     def rebuild_windows(self, select_active=False, keep_wid=None):
         self.mode = "window"
         self.prompt.set_text("windows:")
@@ -783,6 +816,7 @@ class Switcher(Gtk.Window):
         m0 = time.monotonic()
         self.entry.set_text("")
         self.rebuild_windows(select_active=True)
+        self.refresh_status()
         self.fit_height()          # lock the viewport to 12 rows before centering
         self.center()
         self.show_all()
@@ -1072,10 +1106,10 @@ class Switcher(Gtk.Window):
             else:
                 self.on_activate()
             return True
-        if key == Gdk.KEY_Up and not alt and not sup:
+        if key == Gdk.KEY_Up and not alt and not sup and not shift:
             self.move_selection(-1)
             return True
-        if key == Gdk.KEY_Down and not alt and not sup:
+        if key == Gdk.KEY_Down and not alt and not sup and not shift:
             self.move_selection(1)
             return True
         if key in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):
@@ -1100,6 +1134,10 @@ class Switcher(Gtk.Window):
         if ctrl and alt and key == Gdk.KEY_Right:
             self.switch_ws(1)
             return True
+        if ctrl and not shift and not alt and not sup and key in (Gdk.KEY_f,
+                                                                  Gdk.KEY_F):
+            self.toggle_fkeys()
+            return True
 
         if self.mode in ("window", "ws"):
             if key == Gdk.KEY_Delete:
@@ -1120,24 +1158,26 @@ class Switcher(Gtk.Window):
             if ctrl and key in (Gdk.KEY_t, Gdk.KEY_T):
                 self.begin_tag()
                 return True
-            if sup and shift and key == Gdk.KEY_Left:
-                self.move_to_monitor(-1)
-                return True
-            if sup and shift and key == Gdk.KEY_Right:
-                self.move_to_monitor(1)
-                return True
-            if sup and not shift and key == Gdk.KEY_Left:
-                self.set_window_mode("left")
-                return True
-            if sup and not shift and key == Gdk.KEY_Right:
-                self.set_window_mode("right")
-                return True
-            if sup and not shift and key == Gdk.KEY_Up:
-                self.set_window_mode("max")
-                return True
-            if sup and not shift and key == Gdk.KEY_Down:
-                self.set_window_mode("window")
-                return True
+            if shift and not ctrl and not alt and not sup:
+                if key == Gdk.KEY_Left:
+                    self.move_to_monitor(-1)
+                    return True
+                if key == Gdk.KEY_Right:
+                    self.move_to_monitor(1)
+                    return True
+                if key == Gdk.KEY_Up:
+                    self.set_window_mode("max")
+                    return True
+                if key == Gdk.KEY_Down:
+                    self.set_window_mode("window")
+                    return True
+            if not ctrl and not alt and not sup and not shift:
+                if key == Gdk.KEY_Left:
+                    self.set_window_mode("left")
+                    return True
+                if key == Gdk.KEY_Right:
+                    self.set_window_mode("right")
+                    return True
             if Gdk.KEY_F1 <= key <= Gdk.KEY_F12:
                 self.jump_slot(key - Gdk.KEY_F1 + 1)
                 return True
