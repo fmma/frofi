@@ -688,7 +688,7 @@ class Switcher(Gtk.Window):
 
     # --- help (GNOME custom keybindings) -------------------------------------
     def custom_keybindings(self):
-        """Read GNOME's Custom Shortcuts: list of (binding, name).
+        """Read GNOME's Custom Shortcuts: list of (binding, name, command).
 
         These are the user's global shortcuts (gnome-control-center's "Custom
         Shortcuts"), the ones usable from anywhere in GNOME while frofi is not
@@ -707,7 +707,8 @@ class Switcher(Gtk.Window):
             entry = Gio.Settings.new_with_path(schema, path)
             binding = entry.get_string("binding")
             if binding:
-                out.append((binding, entry.get_string("name")))
+                out.append((binding, entry.get_string("name"),
+                            entry.get_string("command")))
         return out
 
     def rebuild_help(self):
@@ -718,7 +719,12 @@ class Switcher(Gtk.Window):
         self.prompt.set_text("help:")
         self.hint.set_markup(HINT_HELP)
         self.clear_rows()
-        for binding, name in self.custom_keybindings():
+        entries = self.custom_keybindings()
+        # The 12 focus-slot shortcuts (F1-F12) are a repetitive block; sort them
+        # to the bottom so the distinct global shortcuts read first. Stable sort
+        # keeps each side's config order.
+        entries.sort(key=lambda e: "focus-slot" in e[2])
+        for binding, name, _cmd in entries:
             combo = prettify_binding(binding)
             markup = f"<b>{pango(combo)}</b>   {pango(name)}"
             self.add_row("", "", "", None, markup, f"{combo} {name}")
