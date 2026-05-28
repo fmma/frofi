@@ -792,6 +792,14 @@ class Switcher(Gtk.Window):
         self.listbox.select_row(vis[idx])
         self.scroll_to(vis[idx])
 
+    def select_edge(self, last):
+        vis = self.visible_rows()
+        if not vis:
+            return
+        row = vis[-1] if last else vis[0]
+        self.listbox.select_row(row)
+        self.scroll_to(row)
+
     def fit_height(self):
         # Size the list viewport to exactly VISIBLE_ROWS rows. Row height depends
         # on font, icon and padding, so measure a real row once and cache it.
@@ -1186,6 +1194,12 @@ class Switcher(Gtk.Window):
             return True
         if key == Gdk.KEY_Page_Down and not alt and not sup and not shift:
             self.move_selection(VISIBLE_ROWS - 1)
+            return True
+        if key == Gdk.KEY_Home and not alt and not sup and not shift:
+            self.select_edge(False)
+            return True
+        if key == Gdk.KEY_End and not alt and not sup and not shift:
+            self.select_edge(True)
             return True
         if key in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab):
             # Cycle window -> workspaces -> drun -> help; Shift+Tab back.
