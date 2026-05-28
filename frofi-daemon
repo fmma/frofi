@@ -113,11 +113,14 @@ HINT_DRUN = ("<b>Enter</b> launch   <b>Ctrl+Alt+←/→</b> switch ws   "
 HINT_HELP = "<b>Tab</b> cycle   <b>Esc</b> close   GNOME custom shortcuts (read-only)"
 HINT_TAG = "<b>Enter</b> save tag   <b>Esc</b> cancel"
 
-# Layout-mode glyphs: floating window, maximized, left half, right half.
-# The floating glyph is an outlined square with an inner block (rather than a
-# plain outline) so it stays distinct from the solid maximized square when a
-# selected row inverts the colors; fill polarity alone would read ambiguously.
-MODE_GLYPHS = {"window": "▣", "max": "■", "left": "◧", "right": "◨"}
+# Layout-mode indicators (floating window, maximized, left half, right half) are
+# drawn as small images (see Switcher._render_mode_icon) rather than text glyphs.
+# A text label inherits the row's foreground color, so the glyph recolored when a
+# row was selected, and its fill polarity (outline vs solid) read ambiguously. A
+# drawn tile uses fixed colors, so it looks identical in every row state.
+MODE_ICON_SIZE = 16
+MODE_ICON_TILE = (0x00 / 255, 0x2b / 255, 0x36 / 255)   # base03, the "screen"
+MODE_ICON_FILL = (0xee / 255, 0xe8 / 255, 0xd5 / 255)   # base2, the occupied area
 
 
 # --- client ------------------------------------------------------------------
@@ -147,6 +150,7 @@ gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("GdkX11", "3.0")
 gi.require_version("Wnck", "3.0")
 from gi.repository import Gtk, Gdk, GdkPixbuf, GdkX11, GLib, Gio, Wnck  # noqa: E402
+import cairo  # noqa: E402
 
 
 # --- helpers -----------------------------------------------------------------
@@ -230,6 +234,7 @@ class Switcher(Gtk.Window):
         self.screen.force_update()   # populate the live window list once
         self.icon_map, self.apps = parse_desktop_files()
         self._icon_cache = {}
+        self._mode_icons = {}
         self.mode = "window"
         self.slot_map = {}          # ws -> 12-element slot list (in-memory)
         self.slots = [""] * 12      # current workspace's slots (view of above)
@@ -359,8 +364,51 @@ class Switcher(Gtk.Window):
             pass
         return None
 
+    def mode_icon(self, key):
+        """Gtk.Image of the layout-mode indicator, or a blank spacer for ''.
+
+        The blank keeps the column width constant so app icons stay aligned in
+        modes (drun, help) that have no indicator.
+        """
+        if not key:
+            img = Gtk.Image()
+            img.set_size_request(MODE_ICON_SIZE, MODE_ICON_SIZE)
+            return img
+        pb = self._mode_icons.get(key)
+        if pb is None:
+            pb = self._render_mode_icon(key)
+            self._mode_icons[key] = pb
+        img = Gtk.Image.new_from_pixbuf(pb)
+        img.set_size_request(MODE_ICON_SIZE, MODE_ICON_SIZE)
+        return img
+
+    def _render_mode_icon(self, key):
+        # A dark "screen" tile with the occupied region filled light. Both colors
+        # are fixed, so the image reads the same on any row background.
+        s = MODE_ICON_SIZE
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, s, s)
+        cr = cairo.Context(surf)
+        cr.set_source_rgb(*MODE_ICON_TILE)
+        cr.rectangle(0, 0, s, s)
+        cr.fill()
+        m = 3                       # margin between tile edge and occupied area
+        iw = s - 2 * m
+        cr.set_source_rgb(*MODE_ICON_FILL)
+        if key == "max":
+            cr.rectangle(m, m, iw, iw)
+        elif key == "left":
+            cr.rectangle(m, m, iw / 2 - 0.5, iw)
+        elif key == "right":
+            cr.rectangle(m + iw / 2 + 0.5, m, iw / 2 - 0.5, iw)
+        else:                       # "window": a small centered floating block
+            bw = iw * 0.55
+            cr.rectangle((s - bw) / 2, (s - bw) / 2, bw, bw)
+        cr.fill()
+        surf.flush()
+        return Gdk.pixbuf_get_from_surface(surf, 0, 0, s, s)
+
     # --- row construction ----------------------------------------------------
-    def add_row(self, slot_text, mode_glyph, mode_digit, icon_name, markup,
+    def add_row(self, slot_text, mode_key, mode_digit, icon_name, markup,
                 search, selectable=True, **data):
         row = Gtk.ListBoxRow()
         row.search_text = search.lower()
@@ -376,11 +424,15 @@ class Switcher(Gtk.Window):
         slot.set_width_chars(3)
         slot.get_style_context().add_class("slot")
         rb.pack_start(slot, False, False, 0)
-        # Layout-mode glyph followed inline by the monitor digit (e.g. "◧2").
-        mode = Gtk.Label(label=mode_glyph + mode_digit, xalign=0.0)
-        mode.set_width_chars(2)             # glyph plus an optional monitor digit
-        mode.get_style_context().add_class("mode")
-        rb.pack_start(mode, False, False, 0)
+        # Layout-mode indicator image followed by the monitor digit (e.g. ◧ "2").
+        modebox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        modebox.set_valign(Gtk.Align.CENTER)
+        modebox.pack_start(self.mode_icon(mode_key), False, False, 0)
+        digit = Gtk.Label(label=mode_digit, xalign=0.0)
+        digit.set_width_chars(1)            # optional monitor number
+        digit.get_style_context().add_class("mode")
+        modebox.pack_start(digit, False, False, 0)
+        rb.pack_start(modebox, False, False, 0)
         rb.pack_start(self.icon_image(icon_name), False, False, 0)
         lbl = Gtk.Label(xalign=0.0)
         lbl.set_markup(markup)
@@ -446,7 +498,7 @@ class Switcher(Gtk.Window):
         return rows, all_ids
 
     def window_indicator(self, geo, vmax, hmax):
-        """Return (mode glyph, monitor digit) for a window.
+        """Return (mode key, monitor digit) for a window.
 
         GNOME's half-tile (Super+Left/Right) maximizes vertically but not
         horizontally and pins the window to one side, so vmax-without-hmax
@@ -461,14 +513,13 @@ class Switcher(Gtk.Window):
                 mi, mgeo = i, g
                 break
         if vmax and hmax:
-            glyph = MODE_GLYPHS["max"]
+            mode = "max"
         elif vmax and not hmax and mgeo is not None:
-            glyph = (MODE_GLYPHS["left"] if cx < mgeo.x + mgeo.width // 2
-                     else MODE_GLYPHS["right"])
+            mode = "left" if cx < mgeo.x + mgeo.width // 2 else "right"
         else:
-            glyph = MODE_GLYPHS["window"]
+            mode = "window"
         digit = str(mi + 1) if len(self._monitors) > 1 and mi >= 0 else ""
-        return glyph, digit
+        return mode, digit
 
     # --- slots (in-memory, per workspace) ------------------------------------
     def slots_for(self, ws):
@@ -522,10 +573,10 @@ class Switcher(Gtk.Window):
         if tag:
             markup += f"  <span color='#8ab4f8'>[{pango(tag)}]</span>"
         slot_text = f"F{slot_i + 1}" if slot_i is not None else ""
-        glyph, digit = self.window_indicator(geo, vmax, hmax)
+        mode_key, digit = self.window_indicator(geo, vmax, hmax)
         search = title + " " + tag
         icon = self.icon_map.get(inst, inst)
-        return self.add_row(slot_text, glyph, digit, icon, markup, search,
+        return self.add_row(slot_text, mode_key, digit, icon, markup, search,
                             wid=wid)
 
     def _emit_group(self, win_rows, slots, keep_wid, active,
