@@ -123,7 +123,12 @@ HINT_TAG = "<b>Enter</b> save tag   <b>Esc</b> cancel"
 # drawn tile uses fixed colors, so it looks identical in every row state.
 MODE_ICON_SIZE = 16
 MODE_ICON_TILE = (0x00 / 255, 0x2b / 255, 0x36 / 255)   # base03, the "screen"
-MODE_ICON_FILL = (0xee / 255, 0xe8 / 255, 0xd5 / 255)   # base2, the occupied area
+# Fill brightness encodes visibility: solid bright for windows with any
+# uncovered area, dimmer for fully covered windows. The shape itself
+# (max/half/floating) stays drawn either way so the layout reads at a glance
+# even for hidden windows.
+MODE_ICON_FILL_VISIBLE = (0xee / 255, 0xe8 / 255, 0xd5 / 255)  # base2
+MODE_ICON_FILL_HIDDEN  = (0x58 / 255, 0x6e / 255, 0x75 / 255)  # base01
 
 
 # --- client ------------------------------------------------------------------
@@ -328,6 +333,60 @@ def f13_grab_loop(on_press):
             GLib.idle_add(on_press)
 
 
+# --- rectangle coverage ------------------------------------------------------
+# Classify each window as fully visible / partially covered / fully hidden by
+# subtracting every higher-stacked window's rect from the candidate's own
+# rect. Whatever remains is the uncovered area; nothing remaining = hidden,
+# unmodified = full, anything else = partial.
+def _rect_intersect(a, b):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    x1, y1 = max(ax, bx), max(ay, by)
+    x2, y2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2 - x1, y2 - y1)
+
+
+def _rect_subtract(piece, hole):
+    # Returns up-to-4 axis-aligned remainders of `piece` outside `hole`,
+    # assuming `hole` is the intersection of `piece` with another rect (so
+    # it lies entirely within `piece`).
+    px, py, pw, ph = piece
+    hx, hy, hw, hh = hole
+    out = []
+    if hy > py:
+        out.append((px, py, pw, hy - py))
+    if hy + hh < py + ph:
+        out.append((px, hy + hh, pw, (py + ph) - (hy + hh)))
+    if hx > px:
+        out.append((px, hy, hx - px, hh))
+    if hx + hw < px + pw:
+        out.append((hx + hw, hy, (px + pw) - (hx + hw), hh))
+    return out
+
+
+def _classify_visibility(candidate, higher):
+    cw, ch = candidate[2], candidate[3]
+    if cw <= 0 or ch <= 0:
+        return "hidden"
+    remaining = [candidate]
+    touched = False
+    for h in higher:
+        nxt = []
+        for piece in remaining:
+            inter = _rect_intersect(piece, h)
+            if inter is None:
+                nxt.append(piece)
+            else:
+                touched = True
+                nxt.extend(_rect_subtract(piece, inter))
+        remaining = nxt
+        if not remaining:
+            return "hidden"
+    return "full" if not touched else "partial"
+
+
 # --- helpers -----------------------------------------------------------------
 def wid_str(window):
     # Zero-padded X window id, matching wmctrl/xprop conventions.
@@ -483,6 +542,14 @@ class Switcher(Gtk.Window):
         self.connect("key-press-event", self.on_key)
         self.connect("map-event", self.on_map)
         self.listbox.connect("row-activated", lambda _b, _r: self.on_activate())
+        # Visibility classification depends on the live X stack, so re-render
+        # rows whenever it shifts (e.g. Ctrl+Enter raises a window while the
+        # popup stays open). The rebuild is cheap and only runs when mapped.
+        self.screen.connect("window-stacking-changed", self._on_stack_change)
+        self.screen.connect("window-opened",
+                            lambda s, _w: self._on_stack_change(s))
+        self.screen.connect("window-closed",
+                            lambda s, _w: self._on_stack_change(s))
         self.realize()
 
     # --- live X queries (Wnck, no subprocess) --------------------------------
@@ -545,7 +612,7 @@ class Switcher(Gtk.Window):
             pass
         return None
 
-    def mode_icon(self, key):
+    def mode_icon(self, key, vis="full"):
         """Gtk.Image of the layout-mode indicator, or a blank spacer for ''.
 
         The blank keeps the column width constant so app icons stay aligned in
@@ -555,17 +622,19 @@ class Switcher(Gtk.Window):
             img = Gtk.Image()
             img.set_size_request(MODE_ICON_SIZE, MODE_ICON_SIZE)
             return img
-        pb = self._mode_icons.get(key)
+        cache_key = (key, vis)
+        pb = self._mode_icons.get(cache_key)
         if pb is None:
-            pb = self._render_mode_icon(key)
-            self._mode_icons[key] = pb
+            pb = self._render_mode_icon(key, vis)
+            self._mode_icons[cache_key] = pb
         img = Gtk.Image.new_from_pixbuf(pb)
         img.set_size_request(MODE_ICON_SIZE, MODE_ICON_SIZE)
         return img
 
-    def _render_mode_icon(self, key):
-        # A dark "screen" tile with the occupied region filled light. Both colors
-        # are fixed, so the image reads the same on any row background.
+    def _render_mode_icon(self, key, vis):
+        # A dark "screen" tile with the occupied region filled. Fill brightness
+        # reflects visibility (full/partial/hidden); the shape is the same in
+        # every state so the tile read survives even for hidden windows.
         s = MODE_ICON_SIZE
         surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, s, s)
         cr = cairo.Context(surf)
@@ -574,7 +643,9 @@ class Switcher(Gtk.Window):
         cr.fill()
         m = 3                       # margin between tile edge and occupied area
         iw = s - 2 * m
-        cr.set_source_rgb(*MODE_ICON_FILL)
+        fill = (MODE_ICON_FILL_HIDDEN if vis == "hidden"
+                else MODE_ICON_FILL_VISIBLE)
+        cr.set_source_rgb(*fill)
         if key == "max":
             cr.rectangle(m, m, iw, iw)
         elif key == "left":
@@ -590,7 +661,7 @@ class Switcher(Gtk.Window):
 
     # --- row construction ----------------------------------------------------
     def add_row(self, slot_text, mode_key, mode_digit, icon_name, markup,
-                search, selectable=True, **data):
+                search, selectable=True, mode_vis="full", **data):
         row = Gtk.ListBoxRow()
         row.search_text = search.lower()
         if not selectable:                  # empty slot placeholder; skip on nav
@@ -608,7 +679,7 @@ class Switcher(Gtk.Window):
         # Layout-mode indicator image followed by the monitor digit (e.g. ◧ "2").
         modebox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
         modebox.set_valign(Gtk.Align.CENTER)
-        modebox.pack_start(self.mode_icon(mode_key), False, False, 0)
+        modebox.pack_start(self.mode_icon(mode_key, mode_vis), False, False, 0)
         digit = Gtk.Label(label=mode_digit, xalign=0.0)
         digit.set_width_chars(1)            # optional monitor number
         digit.get_style_context().add_class("mode")
@@ -658,8 +729,25 @@ class Switcher(Gtk.Window):
         """Return (ordered current-ws rows, all live wids).
 
         Reads the live Wnck window list (kept current via X events), so it
-        spawns nothing. Rows are (wid, instance, title, geometry, vmax, hmax).
+        spawns nothing. Rows are (wid, instance, title, geometry, vmax, hmax,
+        vis), where vis is one of "full"/"partial"/"hidden".
         """
+        # Build the bottom-to-top stack of unminimised windows on this
+        # workspace so each candidate can be compared against everything
+        # currently drawn above it. Minimised windows can't occlude anything.
+        stacked = []
+        for w in self.screen.get_windows_stacked():
+            if w.is_skip_tasklist() or w.is_minimized():
+                continue
+            wsobj = w.get_workspace()
+            if wsobj is None or wsobj.get_number() != ws:
+                continue
+            stacked.append((wid_str(w), w.get_geometry()))
+        vis_map = {}
+        for i, (wid, geo) in enumerate(stacked):
+            vis_map[wid] = _classify_visibility(geo,
+                                                [r[1] for r in stacked[i+1:]])
+
         rows, all_ids = [], []
         for w in self.screen.get_windows():
             if w.is_skip_tasklist():
@@ -673,9 +761,13 @@ class Switcher(Gtk.Window):
             if wsobj is not None and wsobj.get_number() == ws:
                 gx, gy, gw, gh = w.get_geometry()
                 inst = (w.get_class_instance_name() or "").lower()
+                # Minimized windows aren't drawn, so call them hidden even
+                # though they don't appear in the stacked list above.
+                vis = "hidden" if w.is_minimized() else vis_map.get(wid, "full")
                 rows.append((wid, inst, title, (gx, gy, gw, gh),
                              w.is_maximized_vertically(),
-                             w.is_maximized_horizontally()))
+                             w.is_maximized_horizontally(),
+                             vis))
         return rows, all_ids
 
     def window_indicator(self, geo, vmax, hmax):
@@ -746,7 +838,7 @@ class Switcher(Gtk.Window):
                 del self.tags[wid]
 
     def _emit_window(self, rec, slot_i, active):
-        wid, inst, title, geo, vmax, hmax = rec
+        wid, inst, title, geo, vmax, hmax, vis = rec
         if active and int(wid, 16) == active:
             self._active_geo = geo
         tag = self.tags.get(wid, "")
@@ -758,7 +850,7 @@ class Switcher(Gtk.Window):
         search = title + " " + tag
         icon = self.icon_map.get(inst, inst)
         return self.add_row(slot_text, mode_key, digit, icon, markup, search,
-                            wid=wid)
+                            mode_vis=vis, wid=wid)
 
     def _emit_group(self, win_rows, slots, keep_wid, active,
                     placeholders=True, ws=None):
@@ -888,6 +980,12 @@ class Switcher(Gtk.Window):
             self.rebuild_ws(**kw)
         else:
             self.rebuild_windows(**kw)
+
+    def _on_stack_change(self, _screen):
+        # Wnck signals can fire while the popup is hidden (background X
+        # activity); skip those rebuilds so we don't churn for nothing.
+        if self.get_mapped() and self.mode in ("window", "ws"):
+            self.rebuild_current(keep_wid=self.selected_wid())
 
     def wid_ws(self, wid):
         w = self.wnck_window(wid)
