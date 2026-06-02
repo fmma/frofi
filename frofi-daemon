@@ -1114,6 +1114,11 @@ class Switcher(Gtk.Window):
         w = self.wnck_window(wid)
         if w is None:
             return
+        # Fullscreen windows have _NET_WM_ALLOWED_ACTIONS without MAXIMIZE/MOVE/
+        # RESIZE, so mutter ignores tile/max/float ClientMessages until fullscreen
+        # is cleared. Clear it first; the subsequent action then takes effect.
+        if w.is_fullscreen():
+            w.set_fullscreen(False)
         gx, gy, gw, gh = w.get_geometry()
         if mode == "max":
             w.unmaximize()
