@@ -23,6 +23,8 @@ Features:
   - Tab cycles window list -> workspaces -> drun launcher -> help.
   - Help lists the GNOME custom shortcuts usable outside frofi.
 """
+import ctypes
+import ctypes.util
 import fcntl
 import glob
 import os
@@ -31,6 +33,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 OWN_TITLE = "frofi-daemon-window"
@@ -99,14 +102,14 @@ CSS = b"""
 HINT_WINDOW = ("<b>Ctrl+Enter</b> focus   <b>Del</b> close   "
                "<b>Alt+←/→</b> move ws   <b>Alt+↑/↓</b> reorder   "
                "<b>Ctrl+Alt+←/→</b> switch ws\n"
-               "<b>←/→</b> tile   <b>Shift+↑/↓</b> max/float   "
-               "<b>Shift+←/→</b> monitor   <b>Ctrl+T</b> tag   "
+               "<b>←/→</b> tile   <b>Super+↑/↓</b> max/float   "
+               "<b>Super+←/→</b> monitor   <b>Ctrl+T</b> tag   "
                "<b>Ctrl+F</b> F-keys   <b>Tab</b> cycle")
 HINT_WS = ("<b>Ctrl+Enter</b> focus   <b>Del</b> close   "
            "<b>Alt+←/→</b> move ws   <b>Alt+↑/↓</b> reorder   "
            "<b>Ctrl+Alt+←/→</b> switch ws\n"
-           "<b>←/→</b> tile   <b>Shift+↑/↓</b> max/float   "
-           "<b>Shift+←/→</b> monitor   <b>Ctrl+T</b> tag   "
+           "<b>←/→</b> tile   <b>Super+↑/↓</b> max/float   "
+           "<b>Super+←/→</b> monitor   <b>Ctrl+T</b> tag   "
            "<b>Ctrl+F</b> F-keys   <b>Tab</b> cycle")
 HINT_DRUN = ("<b>Enter</b> launch   <b>Ctrl+Alt+←/→</b> switch ws   "
              "<b>Ctrl+R</b> refresh   <b>Tab</b> cycle")
@@ -151,6 +154,178 @@ gi.require_version("GdkX11", "3.0")
 gi.require_version("Wnck", "3.0")
 from gi.repository import Gtk, Gdk, GdkPixbuf, GdkX11, GLib, Gio, Wnck  # noqa: E402
 import cairo  # noqa: E402
+
+
+# --- raw X bindings ----------------------------------------------------------
+# super-remap turns the physical left Super (keycode 133) into the F13 keysym,
+# so it isn't a modifier and Gdk never sets MOD4 when it's held. The daemon
+# uses libX11 directly for two jobs that Gdk doesn't expose cleanly:
+#   - XQueryKeymap to read whether keycode 133 is currently held when the
+#     popup opens (bootstraps the super_held flag for the first chord).
+#   - XGrabKey + XNextEvent in a background thread to own the F13 launch
+#     binding ourselves; mutter's custom-keybinding flow holds an active
+#     keyboard grab from press until release, which blocks the popup's own
+#     seat grab while Super is still down. Owning the grab lets us use
+#     GrabModeAsync so events flow freely.
+_xlib = ctypes.CDLL(ctypes.util.find_library('X11'))
+_xlib.XOpenDisplay.restype = ctypes.c_void_p
+_xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+_xlib.XQueryKeymap.restype = None
+_xlib.XQueryKeymap.argtypes = [ctypes.c_void_p, ctypes.c_char * 32]
+_xlib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+_xlib.XDefaultRootWindow.restype = ctypes.c_ulong
+_xlib.XGrabKey.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint,
+                           ctypes.c_ulong, ctypes.c_int,
+                           ctypes.c_int, ctypes.c_int]
+_xlib.XGrabKey.restype = ctypes.c_int
+_xlib.XUngrabKeyboard.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+_xlib.XUngrabKeyboard.restype = ctypes.c_int
+_xlib.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_xlib.XSync.restype = ctypes.c_int
+_xlib.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_xlib.XNextEvent.restype = ctypes.c_int
+_xlib.XkbSetDetectableAutoRepeat.argtypes = [
+    ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+_xlib.XkbSetDetectableAutoRepeat.restype = ctypes.c_int
+_xlib.XkbKeycodeToKeysym.argtypes = [ctypes.c_void_p, ctypes.c_ubyte,
+                                      ctypes.c_int, ctypes.c_int]
+_xlib.XkbKeycodeToKeysym.restype = ctypes.c_ulong
+_xlib.XGetErrorText.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                 ctypes.c_char_p, ctypes.c_int]
+_xlib.XGetErrorText.restype = ctypes.c_int
+_xlib.XSetErrorHandler.argtypes = [ctypes.c_void_p]
+_xlib.XSetErrorHandler.restype = ctypes.c_void_p
+
+LEFT_SUPER_KEYCODE = 133            # the physical Super key that emits F13
+_F13_KEYSYM = 0xffca
+
+
+class _XErrorEvent(ctypes.Structure):
+    _fields_ = [
+        ('type', ctypes.c_int),
+        ('display', ctypes.c_void_p),
+        ('resourceid', ctypes.c_ulong),
+        ('serial', ctypes.c_ulong),
+        ('error_code', ctypes.c_ubyte),
+        ('request_code', ctypes.c_ubyte),
+        ('minor_code', ctypes.c_ubyte),
+    ]
+
+
+@ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(_XErrorEvent))
+def _x_error_handler(display, errev):
+    # Xlib's default handler exits the process on errors. Replace it with one
+    # that logs to stderr so a refused XGrabKey (e.g. someone else holds the
+    # passive grab on F13) is visible instead of silent. Gdk's per-call error
+    # traps still win because they install their own handler around their
+    # requests via XSetErrorHandler and restore on the way out.
+    err = errev.contents
+    buf = ctypes.create_string_buffer(256)
+    _xlib.XGetErrorText(display, err.error_code, buf, 256)
+    print(f"frofi-daemon: X error ({buf.value.decode('utf-8', 'replace')}): "
+          f"request={err.request_code}.{err.minor_code} "
+          f"resource={err.resourceid:#x}",
+          file=sys.stderr, flush=True)
+    return 0
+
+
+_xlib.XSetErrorHandler(ctypes.cast(_x_error_handler, ctypes.c_void_p))
+
+
+class _XKeyEvent(ctypes.Structure):
+    _fields_ = [
+        ('type', ctypes.c_int),
+        ('serial', ctypes.c_ulong),
+        ('send_event', ctypes.c_int),
+        ('display', ctypes.c_void_p),
+        ('window', ctypes.c_ulong),
+        ('root', ctypes.c_ulong),
+        ('subwindow', ctypes.c_ulong),
+        ('time', ctypes.c_ulong),
+        ('x', ctypes.c_int),
+        ('y', ctypes.c_int),
+        ('x_root', ctypes.c_int),
+        ('y_root', ctypes.c_int),
+        ('state', ctypes.c_uint),
+        ('keycode', ctypes.c_uint),
+        ('same_screen', ctypes.c_int),
+    ]
+
+
+class _XEvent(ctypes.Union):
+    # XEvent's union is 192 bytes on 64-bit; pad to that so XNextEvent never
+    # writes past the end whatever event type arrives.
+    _fields_ = [('type', ctypes.c_int),
+                ('xkey', _XKeyEvent),
+                ('_pad', ctypes.c_long * 24)]
+
+
+_KEY_PRESS = 2
+_KEY_RELEASE = 3
+_GRAB_MODE_ASYNC = 1
+# XGrabKey matches the modifier state exactly, so a separate grab is needed
+# for each combination of Lock-class modifiers that can be folded into it.
+_LOCK_MASK = 1 << 1                 # CapsLock
+_MOD2_MASK = 1 << 4                 # NumLock
+_LOCK_COMBOS = (0, _LOCK_MASK, _MOD2_MASK, _LOCK_MASK | _MOD2_MASK)
+
+
+def keycode_held(xdisplay, kc):
+    if not xdisplay:
+        return False
+    keys = (ctypes.c_char * 32)()
+    _xlib.XQueryKeymap(xdisplay, keys)
+    return bool(keys[kc // 8][0] & (1 << (kc % 8)))
+
+
+def wait_for_super_remap(xdisplay, timeout=5.0):
+    """Block until keycode 133 emits F13, i.e. super-remap has finished.
+
+    Both super-remap and frofi-daemon are XDG autostart entries with no
+    declared ordering. If frofi grabs the keycode while Super_L is still in
+    mod4 (super-remap not yet done), a quick Super+arrow chord can leak to
+    mutter's <Super>Up=maximize passive grab on the background window before
+    the popup's seat grab lands. Waiting on the remap closes that window.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _xlib.XkbKeycodeToKeysym(xdisplay, LEFT_SUPER_KEYCODE,
+                                     0, 0) == _F13_KEYSYM:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def f13_grab_loop(on_press):
+    """Passively grab the left-Super keycode in a dedicated X connection;
+    post `on_press` to the GTK main loop on each fresh KeyPress.
+
+    XGrabKey establishes an active grab on this connection whenever the key
+    fires. Releasing it immediately (XUngrabKeyboard) lets the popup's own
+    seat grab — on Gdk's separate X connection — claim the keyboard while
+    Super is still held. Auto-repeat may briefly re-trigger the passive grab
+    between ungrab and seat-grab, but on_press is idempotent so duplicate
+    schedules are harmless.
+    """
+    dpy = _xlib.XOpenDisplay(None)
+    if not dpy:
+        print("frofi-daemon: F13 grab cannot open display",
+              file=sys.stderr, flush=True)
+        return
+    supported = ctypes.c_int(0)
+    _xlib.XkbSetDetectableAutoRepeat(dpy, 1, ctypes.byref(supported))
+    root = _xlib.XDefaultRootWindow(dpy)
+    for mods in _LOCK_COMBOS:
+        _xlib.XGrabKey(dpy, LEFT_SUPER_KEYCODE, mods, root, 1,
+                       _GRAB_MODE_ASYNC, _GRAB_MODE_ASYNC)
+    _xlib.XSync(dpy, 0)
+    ev = _XEvent()
+    while True:
+        _xlib.XNextEvent(dpy, ctypes.byref(ev))
+        if ev.type == _KEY_PRESS and ev.xkey.keycode == LEFT_SUPER_KEYCODE:
+            _xlib.XUngrabKeyboard(dpy, 0)   # CurrentTime
+            _xlib.XSync(dpy, 0)
+            GLib.idle_add(on_press)
 
 
 # --- helpers -----------------------------------------------------------------
@@ -243,6 +418,12 @@ class Switcher(Gtk.Window):
         self._active_geo = None     # focused window geometry, for monitor pick
         self._row_h = None          # measured row height, for the 12-row viewport
         self._vis_groups = set()    # ws groups with a visible window (ws mode)
+        # Left Super (keycode 133) is mapped to F13 and isn't a modifier, so
+        # Gdk never reports it via event.state. on_key live-queries the X
+        # server (XQueryKeymap) to tell whether the physical key is still down,
+        # which beats tracking press/release through Gdk because auto-repeat
+        # injects fake KeyRelease events that would clear the state spuriously.
+        self._xdpy = _xlib.XOpenDisplay(None)
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         box.set_name("frame")               # carries the 1px window frame border
@@ -940,6 +1121,10 @@ class Switcher(Gtk.Window):
         return True                 # keep retrying on the timeout
 
     def show_switcher(self, origin=None):
+        # Idempotent: the F13 grab thread can briefly re-fire during the gap
+        # between its XUngrabKeyboard and the popup's seat.grab landing.
+        if self.get_mapped():
+            return
         recv = time.time()         # realtime, comparable to the wrapper's t0
         m0 = time.monotonic()
         self.entry.set_text("")
@@ -1218,8 +1403,13 @@ class Switcher(Gtk.Window):
         ctrl = bool(mods & Gdk.ModifierType.CONTROL_MASK)
         alt = bool(mods & Gdk.ModifierType.MOD1_MASK)
         shift = bool(mods & Gdk.ModifierType.SHIFT_MASK)
-        sup = bool(mods & (Gdk.ModifierType.SUPER_MASK
-                           | Gdk.ModifierType.MOD4_MASK))
+        # Right Super (still in mod4) reports through event.state. For left
+        # Super (remapped to F13), query the X server directly: auto-repeat
+        # interleaves fake KeyRelease events that would defeat any release-
+        # based state machine.
+        sup = (bool(mods & (Gdk.ModifierType.SUPER_MASK
+                            | Gdk.ModifierType.MOD4_MASK))
+               or keycode_held(self._xdpy, LEFT_SUPER_KEYCODE))
 
         if self.mode == "tag":
             if key == Gdk.KEY_Escape:
@@ -1305,7 +1495,7 @@ class Switcher(Gtk.Window):
             if ctrl and key in (Gdk.KEY_t, Gdk.KEY_T):
                 self.begin_tag()
                 return True
-            if shift and not ctrl and not alt and not sup:
+            if sup and not ctrl and not alt and not shift:
                 if key == Gdk.KEY_Left:
                     self.move_to_monitor(-1)
                     return True
@@ -1425,6 +1615,22 @@ def run_daemon():
                          lambda: (win.show_switcher(), True)[1])
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, shutdown)
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, shutdown)
+
+    # Own the launch grab ourselves instead of routing through a GNOME custom
+    # shortcut. Mutter's keybinding flow holds an active keyboard grab until
+    # the trigger key releases, which blocks the popup's own seat grab; with
+    # XGrabKey in GrabModeAsync the keyboard stays free, so a hold-then-arrow
+    # chord lands on the first press.
+    def trigger_show():
+        win.show_switcher()
+        return False
+    if not wait_for_super_remap(win._xdpy):
+        print("frofi-daemon: super-remap did not complete in time; "
+              "F13 grab may misbehave until it runs", file=sys.stderr,
+              flush=True)
+    threading.Thread(target=f13_grab_loop, args=(trigger_show,),
+                     daemon=True, name="frofi-f13-grab").start()
+
     print(f"frofi-daemon ready (pid {os.getpid()})", file=sys.stderr, flush=True)
     Gtk.main()
 
