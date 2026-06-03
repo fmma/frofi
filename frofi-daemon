@@ -394,24 +394,27 @@ def wid_str(window):
     return "0x%08x" % window.get_xid()
 
 
-# Synthetic ids for wezterm tabs share the slot pool with X11 window ids. The
-# "wt:" prefix keeps the two name spaces distinguishable everywhere a wid is
-# consumed (slot maps, tag dict, IPC, active comparisons).
-TAB_WID_PREFIX = "wt:"
+# Synthetic ids for tmux sessions share the slot pool with X11 window ids.
+# The "tm:" prefix keeps the two name spaces distinguishable everywhere a wid
+# is consumed (slot maps, tag dict, IPC, active comparisons).
+TMUX_WID_PREFIX = "tm:"
 WEZTERM_INST = "org.wezfurlong.wezterm"
 # wezterm.lua's format-window-title prepends "wez:<window_id>:<active_tab_id> "
-# so frofi can map each X11 wezterm window back to its mux window id and tell
-# which tab is currently on top (the CLI's per-pane is_active does not give
-# the active-tab-of-window).
+# so frofi can recover the mux window_id of each X11 wezterm window. With one
+# tab per window the second field is always 0; it's retained for forwards
+# compatibility and to avoid churning the lua side again.
 WEZTERM_TITLE_PREFIX_RE = re.compile(r"^wez:(\d+):(\d+) ")
+# Virtual-window sessions are named "ws<N>-<id>"; the prefix scopes a session
+# to its workspace. Sessions whose names don't match are ignored by frofi.
+TMUX_SESSION_RE = re.compile(r"^ws(\d+)-")
 
 
-def is_tab_wid(wid):
-    return isinstance(wid, str) and wid.startswith(TAB_WID_PREFIX)
+def is_tmux_wid(wid):
+    return isinstance(wid, str) and wid.startswith(TMUX_WID_PREFIX)
 
 
-def tab_pane_id(wid):
-    return wid[len(TAB_WID_PREFIX):]
+def tmux_session_name(wid):
+    return wid[len(TMUX_WID_PREFIX):]
 
 
 def pango(s):
@@ -495,10 +498,12 @@ class Switcher(Gtk.Window):
         self.slots = [""] * 12      # current workspace's slots (view of above)
         self.tags = {}              # wid -> tag, in-memory for the daemon's life
         self.tag_target = None      # wid being tagged in tag mode
-        # Tab wid (e.g. "wt:42") -> X11 xid of the parent wezterm window. Set
-        # by list_windows during rebuild; consulted by tile/max/move-monitor/
-        # close to route those ops to the parent window when a tab is selected.
-        self._tab_parent = {}
+        # Session wid (e.g. "tm:ws3-1234") -> X11 xid of the host wezterm
+        # window on its workspace, plus the tty_name of the host pane (used
+        # to direct `tmux switch-client -c <tty>` at the right client). Set
+        # by list_windows during rebuild.
+        self._session_parent = {}     # wid -> xid
+        self._session_client_tty = {} # ws -> client_tty for that workspace's host
         self._active_geo = None     # focused window geometry, for monitor pick
         self._row_h = None          # measured row height, for the 12-row viewport
         self._vis_groups = set()    # ws groups with a visible window (ws mode)
@@ -591,8 +596,8 @@ class Switcher(Gtk.Window):
 
     def active_wid_str(self):
         """Wid string of the row that represents the currently-focused
-        thing. For a focused wezterm window it's the wt:<pane_id> of the
-        active pane in the active tab; for everything else it's the X11
+        thing. For a focused wezterm window it's "tm:<session>" of the
+        session attached to that wezterm; for everything else it's the X11
         wid hex. Returns "" when nothing useful is focused.
         """
         active = self.active_xid()
@@ -608,19 +613,25 @@ class Switcher(Gtk.Window):
         if (focus_win.get_class_instance_name() or "").lower() == WEZTERM_INST:
             m = WEZTERM_TITLE_PREFIX_RE.match(focus_win.get_name() or "")
             if m is not None:
-                winid, active_tab_id = int(m.group(1)), int(m.group(2))
+                winid = int(m.group(1))
+                tty = None
                 for p in self._wezterm_panes():
                     if (p.get("window_id") == winid
-                            and p.get("tab_id") == active_tab_id
-                            and p.get("is_active")):
-                        return TAB_WID_PREFIX + str(p["pane_id"])
+                            and p.get("is_active")
+                            and p.get("tty_name")):
+                        tty = p["tty_name"]
+                        break
+                if tty:
+                    sess = self._tmux_clients().get(tty)
+                    if sess:
+                        return TMUX_WID_PREFIX + sess
         return "0x%08x" % active
 
     def wnck_window(self, wid):
-        # Tabs aren't X11 windows; callers that may receive a tab wid go
-        # through wnck_for_action or the activate/close helpers instead.
-        if is_tab_wid(wid):
-            xid = self._tab_parent.get(wid)
+        # Sessions aren't X11 windows; for tile/max/move-monitor etc. we
+        # return the host wezterm window so the op applies to the viewport.
+        if is_tmux_wid(wid):
+            xid = self._session_parent.get(wid)
             if xid is None:
                 return None
             for w in self.screen.get_windows():
@@ -670,6 +681,144 @@ class Switcher(Gtk.Window):
             m = WEZTERM_TITLE_PREFIX_RE.match(w.get_name() or "")
             if m:
                 out[int(m.group(1))] = (w, int(m.group(2)))
+        return out
+
+    # --- tmux CLI --------------------------------------------------------
+    def _tmux(self, *args, capture=False):
+        """Run a tmux command with a tight timeout. Returns stdout when
+        `capture` is set, else None. All errors are swallowed: a missing or
+        stuck tmux must not block rebuild."""
+        try:
+            r = subprocess.run(["tmux", *args],
+                               capture_output=capture, text=True,
+                               timeout=1.0, check=True)
+        except (OSError, subprocess.SubprocessError):
+            return "" if capture else None
+        return r.stdout if capture else None
+
+    def _tmux_sessions(self):
+        """List sessions: [{name, attached, title}].
+
+        title mirrors the SSH-aware logic the wezterm.lua had: a remote
+        host shows as "<host> <remote_path>" parsed from pane_title (which
+        the remote shell maintains via OSC); otherwise the local
+        pane_current_path with $HOME collapsed to ~. Cached for 100 ms so
+        a rebuild_ws sweep makes one tmux call.
+        """
+        now = time.monotonic()
+        cached = getattr(self, "_tmux_cache", None)
+        if cached is not None and now - cached[0] < 0.1:
+            return cached[1]
+        raw = self._tmux("list-panes", "-a", "-F",
+                         "#{session_name}\t#{?session_attached,1,0}\t"
+                         "#{window_active}\t#{pane_active}\t"
+                         "#{pane_current_command}\t#{pane_current_path}\t"
+                         "#{pane_title}\t#{session_path}\t"
+                         "#{pane_tty}",
+                         capture=True) or ""
+        out = []
+        seen = set()
+        for line in raw.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 9:
+                continue
+            (name, attached, win_active, pane_active,
+             cmd, cwd, ptitle, spath, pane_tty) = parts
+            if win_active != "1" or pane_active != "1":
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            out.append({"name": name,
+                        "attached": attached == "1",
+                        "title": self._compose_session_title(
+                            cmd, cwd, ptitle, spath, pane_tty)})
+        self._tmux_cache = (now, out)
+        return out
+
+    @staticmethod
+    def _compose_session_title(cmd, cwd, ptitle, spath, pane_tty=None):
+        # SSH branch: prefer the remote shell's OSC-set "user@host:path"
+        # pane_title; if absent (default bash, etc.), pull the host from
+        # the running ssh process's argv on pane_tty. Falls through to the
+        # local-path branch if both fail.
+        if cmd == "ssh":
+            m = re.search(r"@([\w._-]+):\s*(\S+)", ptitle or "")
+            if m:
+                return f"{m.group(1).split('.')[0]} {m.group(2)}"
+            m = re.search(r"@([\w._-]+)", ptitle or "")
+            if m:
+                return m.group(1).split('.')[0]
+            host = Switcher._ssh_host_from_tty(pane_tty) if pane_tty else None
+            if host:
+                return host.split('.')[0]
+            # fall through
+        path = cwd or spath or ""
+        home = os.path.expanduser("~")
+        # Sole $HOME stays absolute so it's distinguishable from a session
+        # with no path info; only subfolders collapse to ~/.
+        if path.startswith(home + "/"):
+            return "~" + path[len(home):]
+        return path
+
+    # ssh argv parsing: skip the flags that take a value, then return the
+    # first positional with @user@ stripped. Mirrors the lua's "@host" parse
+    # for cases where the remote shell doesn't maintain pane_title.
+    _SSH_TAKES_ARG = frozenset({
+        "-p", "-i", "-l", "-o", "-J", "-L", "-R", "-W", "-D",
+        "-F", "-S", "-E", "-Q", "-O", "-c", "-m", "-b", "-B"})
+
+    @staticmethod
+    def _parse_ssh_host(argv):
+        it = iter(argv[1:])     # argv[0] is "ssh"
+        for tok in it:
+            if tok.startswith("-"):
+                if tok in Switcher._SSH_TAKES_ARG:
+                    next(it, None)
+                continue            # plain short flag, no value to skip
+            return tok.split("@", 1)[1] if "@" in tok else tok
+        return None
+
+    @staticmethod
+    def _ssh_host_from_tty(pane_tty):
+        # Scan ps output for the foreground ssh on this tty. The '+'
+        # in stat marks the foreground process group; that's the ssh the
+        # user is actually talking to (vs. a backgrounded subshell ssh).
+        if not pane_tty or not pane_tty.startswith("/dev/"):
+            return None
+        try:
+            r = subprocess.run(
+                ["ps", "-t", pane_tty[len("/dev/"):],
+                 "-o", "stat=,args="],
+                capture_output=True, text=True,
+                timeout=0.3, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        candidates = []
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            stat, _, args = line.partition(" ")
+            argv = args.split()
+            if not argv or os.path.basename(argv[0]) != "ssh":
+                continue
+            candidates.append((0 if "+" in stat else 1, argv))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda c: c[0])     # foreground first
+        return Switcher._parse_ssh_host(candidates[0][1])
+
+    def _tmux_clients(self):
+        """{client_tty -> session_name} for every attached tmux client."""
+        raw = self._tmux("list-clients", "-F",
+                         "#{client_tty}\t#{client_session}",
+                         capture=True) or ""
+        out = {}
+        for line in raw.splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) == 2 and parts[0]:
+                out[parts[0]] = parts[1]
         return out
 
     def server_time(self):
@@ -829,33 +978,56 @@ class Switcher(Gtk.Window):
     def list_windows(self, ws):
         """Return (ordered current-ws rows, all live wids).
 
-        Reads the live Wnck window list (kept current via X events), so it
-        spawns nothing X-side. Wezterm tabs are discovered via a short
-        `wezterm cli list` and replace their parent X11 window in the list,
-        so each tab is a first-class slot citizen. Rows are (wid, instance,
-        title, geometry, vmax, hmax, vis); wid is "0x..." for windows and
-        "wt:<pane_id>" for tabs.
+        Reads the live Wnck window list (kept current via X events) plus
+        short tmux CLI calls. Each workspace gets at most one host wezterm
+        window; that host's row is hidden in favour of one row per tmux
+        session named "ws<N>-<id>" (its session pool). Rows are (wid,
+        instance, title, geometry, vmax, hmax, vis); wid is "0x..." for
+        plain X11 windows and "tm:<session>" for virtual windows.
         """
-        # Wezterm tab discovery. Failure (no wezterm, timeout, etc.) yields
-        # no tabs and leaves the wezterm X11 windows visible as-is.
+        # Find this workspace's host wezterm window (if any) and which
+        # tmux session its pane is currently attached to.
         panes = self._wezterm_panes()
         wez_windows = self._wezterm_window_index() if panes else {}
-        # One row per (window_id, tab_id); pick the active pane in each tab
-        # so split panes still resolve to a single switchable entry.
-        tab_panes = {}
+        tmux_clients = self._tmux_clients() if panes else {}
+        # window_id -> tty_name of the active pane (one pane per window in
+        # the tmux model, but the active-pane filter keeps things robust).
+        wez_tty = {}
         for p in panes:
-            key = (p.get("window_id"), p.get("tab_id"))
-            if key not in tab_panes or p.get("is_active"):
-                tab_panes[key] = p
-        wez_parent_xids = {wez_windows[wid][0].get_xid()
-                           for (wid, _tid) in tab_panes
-                           if wid in wez_windows}
+            wid = p.get("window_id")
+            if wid in wez_windows and p.get("is_active") and p.get("tty_name"):
+                wez_tty[wid] = p["tty_name"]
+        # Only a wezterm window whose pane is actually attached to a tmux
+        # client counts as a session host; a wezterm started outside of
+        # `wezterm-spawn` (plain `wezterm` invocation) stays a regular row
+        # so the user can still focus/tile/close it.
+        host_xid = None
+        host_geo = None
+        host_vmax = host_hmax = False
+        host_attached_session = None
+        host_tty = None
+        wez_parent_xids = set()
+        for winid, (parent, _) in wez_windows.items():
+            wsobj = parent.get_workspace()
+            if wsobj is None or wsobj.get_number() != ws:
+                continue
+            tty = wez_tty.get(winid)
+            if not tty or tty not in tmux_clients:
+                continue                # plain wezterm, no tmux attached
+            wez_parent_xids.add(parent.get_xid())
+            if host_xid is None:
+                host_xid = parent.get_xid()
+                host_geo = parent.get_geometry()
+                host_vmax = parent.is_maximized_vertically()
+                host_hmax = parent.is_maximized_horizontally()
+                host_tty = tty
+                host_attached_session = tmux_clients.get(tty)
+        # Stash for actions: which client tty to direct switch-client at.
+        self._session_client_tty[ws] = host_tty
 
-        # Build the bottom-to-top stack of unminimised windows on this
-        # workspace so each candidate can be compared against everything
-        # currently drawn above it. Minimised windows can't occlude anything.
-        # Wezterm parents stay in the stack so their visibility informs the
-        # tab rows, but are filtered out of the row list below.
+        # Bottom-to-top stack on this workspace, used both for the regular
+        # vis map and to compute the host wezterm's visibility (which gates
+        # whether the attached session reads as visible).
         stacked = []
         for w in self.screen.get_windows_stacked():
             if w.is_skip_tasklist() or w.is_minimized():
@@ -865,18 +1037,21 @@ class Switcher(Gtk.Window):
                 continue
             stacked.append((w.get_xid(), wid_str(w), w.get_geometry()))
         vis_map = {}
-        parent_vis = {}
+        host_vis = "hidden"
         for i, (xid, wid, geo) in enumerate(stacked):
             higher = [g for _x, _w, g in stacked[i+1:]]
             v = _classify_visibility(geo, higher)
             vis_map[wid] = v
-            if xid in wez_parent_xids:
-                parent_vis[xid] = v
+            if xid == host_xid:
+                host_vis = v
 
         rows, all_ids = [], []
-        # Drop the stale parent->xid mapping; repopulate as tabs are emitted
-        # so closed tabs and renamed wezterm windows don't leak entries.
-        self._tab_parent = {}
+        # Repopulate every rebuild so a closed wezterm or a renamed session
+        # doesn't keep ghost entries pointing at dead xids.
+        self._session_parent = {
+            k: v for k, v in self._session_parent.items()
+            if v != host_xid                    # drop stale entries for ws
+        }
         for w in self.screen.get_windows():
             if w.is_skip_tasklist():
                 continue
@@ -884,7 +1059,7 @@ class Switcher(Gtk.Window):
             if title == OWN_TITLE:
                 continue
             if w.get_xid() in wez_parent_xids:
-                continue                # tabs replace the wezterm parent row
+                continue                # sessions stand in for the host
             wid = wid_str(w)
             all_ids.append(wid)
             wsobj = w.get_workspace()
@@ -899,37 +1074,31 @@ class Switcher(Gtk.Window):
                              w.is_maximized_horizontally(),
                              vis))
 
-        # Wezterm tab rows. Append after the windows; slot mapping will hand
-        # each new tab the lowest-empty slot on first sighting.
-        for (winid, tab_id), pane in tab_panes.items():
-            entry = wez_windows.get(winid)
-            if entry is None:
+        # Virtual-window rows: one per tmux session whose name starts with
+        # "ws<N>-". If the host wezterm is missing we still surface the
+        # workspace's sessions (all dim) so they remain reachable; geometry
+        # falls back to (0, 0, 0, 0) which renders the floating-window
+        # indicator and disables the monitor digit.
+        sessions = self._tmux_sessions() if panes is not None else []
+        geo = host_geo if host_geo is not None else (0, 0, 0, 0)
+        vmax, hmax = host_vmax, host_hmax
+        for sess in sessions:
+            m = TMUX_SESSION_RE.match(sess["name"])
+            if not m:
                 continue
-            parent, active_tab_id = entry
-            wsobj = parent.get_workspace()
-            if wsobj is None or wsobj.get_number() != ws:
+            if int(m.group(1)) != ws:
                 continue
-            if parent.is_minimized():
-                continue
-            wid = TAB_WID_PREFIX + str(pane["pane_id"])
-            self._tab_parent[wid] = parent.get_xid()
+            wid = TMUX_WID_PREFIX + sess["name"]
+            if host_xid is not None:
+                self._session_parent[wid] = host_xid
             all_ids.append(wid)
-            gx, gy, gw, gh = parent.get_geometry()
-            # tab_title is the user-set title (wezterm cli set-tab-title);
-            # otherwise fall back to the pane's program-set title.
-            title = pane.get("tab_title") or pane.get("title") or ""
-            pvis = parent_vis.get(parent.get_xid(), "full")
-            # A tab is visible only when its parent window is visible AND
-            # this is the active tab in that window. Other tabs sit behind
-            # the active one and read as hidden.
-            if pvis == "hidden":
-                tab_vis = "hidden"
+            is_attached = (sess["name"] == host_attached_session)
+            if host_xid is None or host_vis == "hidden":
+                vis = "hidden"
             else:
-                tab_vis = "full" if tab_id == active_tab_id else "hidden"
-            rows.append((wid, WEZTERM_INST, title, (gx, gy, gw, gh),
-                         parent.is_maximized_vertically(),
-                         parent.is_maximized_horizontally(),
-                         tab_vis))
+                vis = "full" if is_attached else "hidden"
+            rows.append((wid, WEZTERM_INST, sess["title"], geo,
+                         vmax, hmax, vis))
         return rows, all_ids
 
     def window_indicator(self, geo, vmax, hmax):
@@ -1421,27 +1590,40 @@ class Switcher(Gtk.Window):
         row = self.listbox.get_selected_row()
         return getattr(row, "wid", None) if row else None
 
-    def _wezterm_cli(self, *args):
-        # Best-effort fire-and-forget invocation; tab activate/close should
-        # never block frofi (a stuck mux must not freeze the popup).
-        try:
-            subprocess.run(["wezterm", "cli", *args],
-                           timeout=1.5, check=False,
-                           stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
-        except (OSError, subprocess.SubprocessError):
-            pass
+    def _ws_of_session(self, name):
+        m = TMUX_SESSION_RE.match(name)
+        return int(m.group(1)) if m else None
 
     def _activate_wid(self, wid, t=None):
-        """Bring `wid` to focus. For tabs, switch wezterm to the pane first
-        and then raise the parent X11 window."""
+        """Bring `wid` to focus. For a virtual window (tmux session) whose
+        workspace still has a host wezterm, retarget that client via
+        `tmux switch-client -c <tty>`. For an orphan (host closed), spawn a
+        fresh wezterm attached to the session so the user recovers it.
+        """
         if t is None:
             t = self.server_time()
-        if is_tab_wid(wid):
-            self._wezterm_cli("activate-pane", "--pane-id", tab_pane_id(wid))
-            parent = self.wnck_window(wid)
-            if parent is not None:
-                parent.activate(t)
+        if is_tmux_wid(wid):
+            name = tmux_session_name(wid)
+            ws = self._ws_of_session(name)
+            tty = self._session_client_tty.get(ws) if ws is not None else None
+            if tty:
+                self._tmux("switch-client", "-c", tty, "-t", name)
+                host = self.wnck_window(wid)
+                if host is not None:
+                    host.activate(t)
+            else:
+                # Orphan session: no host wezterm on its workspace. Spawn
+                # one running `tmux attach`; it inherits the current X11
+                # workspace from where this is launched (frofi or IPC).
+                try:
+                    subprocess.Popen(
+                        ["wezterm", "start", "--",
+                         "tmux", "attach", "-t", name],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True)
+                except OSError:
+                    pass
             return
         w = self.wnck_window(wid)
         if w is not None:
@@ -1469,12 +1651,13 @@ class Switcher(Gtk.Window):
         if not wid:
             return
         self._activate_wid(wid)
-        # Switching a tab leaves the parent X11 window's stacking unchanged,
-        # so window-stacking-changed never fires and the visibility badge
-        # would stay stale. Force a rebuild once wezterm has processed the
-        # activate-pane and the new title prefix has landed.
-        if is_tab_wid(wid):
+        # Switching a tmux session leaves the host X11 window's stacking
+        # unchanged, so window-stacking-changed never fires and the badge
+        # would stay stale. Force a rebuild once tmux has processed the
+        # switch-client and the new client_session mapping has landed.
+        if is_tmux_wid(wid):
             self._panes_cache = None
+            self._tmux_cache = None
             self.schedule(80, lambda: self.rebuild_current(keep_wid=wid))
             win = self.get_window()
             if win is not None and self.get_mapped():
@@ -1507,8 +1690,29 @@ class Switcher(Gtk.Window):
         # down the list, rather than jumping back to the active/first row.
         vis = self.visible_rows()
         idx = vis.index(row) if row in vis else 0
-        if is_tab_wid(wid):
-            self._wezterm_cli("kill-pane", "--pane-id", tab_pane_id(wid))
+        if is_tmux_wid(wid):
+            name = tmux_session_name(wid)
+            ws = self._ws_of_session(name)
+            tty = self._session_client_tty.get(ws) if ws is not None else None
+            # If the killed session is currently attached, the wezterm
+            # client exits with tmux and takes the host window down. Try to
+            # switch the client to another session on the same workspace
+            # first; only if no fallback exists do we accept the wezterm
+            # going down (the user explicitly closed their last session).
+            if tty:
+                attached = self._tmux_clients().get(tty)
+                if attached == name:
+                    fallback = next(
+                        (s["name"] for s in self._tmux_sessions()
+                         if s["name"] != name
+                         and self._ws_of_session(s["name"]) == ws),
+                        None)
+                    if fallback is not None:
+                        self._tmux("switch-client", "-c", tty,
+                                   "-t", fallback)
+            self._tmux("kill-session", "-t", name)
+            self._panes_cache = None
+            self._tmux_cache = None
         else:
             w = self.wnck_window(wid)
             if w is not None:
@@ -1526,6 +1730,11 @@ class Switcher(Gtk.Window):
     def move_to_ws(self, delta):
         wid = self.selected_wid()
         if not wid:
+            return
+        # Virtual windows are tied to the workspace whose host wezterm runs
+        # them; moving the row to another workspace has no physical
+        # meaning, so the shortcut is inert on tm: rows.
+        if is_tmux_wid(wid):
             return
         # In ws mode the selected window may be on any workspace, so move it
         # relative to its own; in windows mode it is on the current one.
