@@ -27,6 +27,7 @@ import ctypes
 import ctypes.util
 import fcntl
 import glob
+import json
 import os
 import re
 import signal
@@ -393,6 +394,26 @@ def wid_str(window):
     return "0x%08x" % window.get_xid()
 
 
+# Synthetic ids for wezterm tabs share the slot pool with X11 window ids. The
+# "wt:" prefix keeps the two name spaces distinguishable everywhere a wid is
+# consumed (slot maps, tag dict, IPC, active comparisons).
+TAB_WID_PREFIX = "wt:"
+WEZTERM_INST = "org.wezfurlong.wezterm"
+# wezterm.lua's format-window-title prepends "wez:<window_id>:<active_tab_id> "
+# so frofi can map each X11 wezterm window back to its mux window id and tell
+# which tab is currently on top (the CLI's per-pane is_active does not give
+# the active-tab-of-window).
+WEZTERM_TITLE_PREFIX_RE = re.compile(r"^wez:(\d+):(\d+) ")
+
+
+def is_tab_wid(wid):
+    return isinstance(wid, str) and wid.startswith(TAB_WID_PREFIX)
+
+
+def tab_pane_id(wid):
+    return wid[len(TAB_WID_PREFIX):]
+
+
 def pango(s):
     return GLib.markup_escape_text(s)
 
@@ -474,6 +495,10 @@ class Switcher(Gtk.Window):
         self.slots = [""] * 12      # current workspace's slots (view of above)
         self.tags = {}              # wid -> tag, in-memory for the daemon's life
         self.tag_target = None      # wid being tagged in tag mode
+        # Tab wid (e.g. "wt:42") -> X11 xid of the parent wezterm window. Set
+        # by list_windows during rebuild; consulted by tile/max/move-monitor/
+        # close to route those ops to the parent window when a tab is selected.
+        self._tab_parent = {}
         self._active_geo = None     # focused window geometry, for monitor pick
         self._row_h = None          # measured row height, for the 12-row viewport
         self._vis_groups = set()    # ws groups with a visible window (ws mode)
@@ -564,12 +589,88 @@ class Switcher(Gtk.Window):
         w = self.screen.get_active_window()
         return w.get_xid() if w is not None else None
 
+    def active_wid_str(self):
+        """Wid string of the row that represents the currently-focused
+        thing. For a focused wezterm window it's the wt:<pane_id> of the
+        active pane in the active tab; for everything else it's the X11
+        wid hex. Returns "" when nothing useful is focused.
+        """
+        active = self.active_xid()
+        if active is None:
+            return ""
+        focus_win = None
+        for w in self.screen.get_windows():
+            if w.get_xid() == active:
+                focus_win = w
+                break
+        if focus_win is None:
+            return ""
+        if (focus_win.get_class_instance_name() or "").lower() == WEZTERM_INST:
+            m = WEZTERM_TITLE_PREFIX_RE.match(focus_win.get_name() or "")
+            if m is not None:
+                winid, active_tab_id = int(m.group(1)), int(m.group(2))
+                for p in self._wezterm_panes():
+                    if (p.get("window_id") == winid
+                            and p.get("tab_id") == active_tab_id
+                            and p.get("is_active")):
+                        return TAB_WID_PREFIX + str(p["pane_id"])
+        return "0x%08x" % active
+
     def wnck_window(self, wid):
+        # Tabs aren't X11 windows; callers that may receive a tab wid go
+        # through wnck_for_action or the activate/close helpers instead.
+        if is_tab_wid(wid):
+            xid = self._tab_parent.get(wid)
+            if xid is None:
+                return None
+            for w in self.screen.get_windows():
+                if w.get_xid() == xid:
+                    return w
+            return None
         target = int(wid, 16)
         for w in self.screen.get_windows():
             if w.get_xid() == target:
                 return w
         return None
+
+    # --- wezterm CLI -----------------------------------------------------
+    def _wezterm_panes(self):
+        """Return wezterm CLI panes (list of dicts); [] on any failure.
+
+        Each pane has window_id, tab_id, pane_id, is_active, title, tab_title.
+        A short timeout keeps the call from stalling rebuild on a wezterm
+        process that's frozen or being torn down. Result is cached for 100 ms
+        so one rebuild_ws sweep (N workspaces -> N+1 calls) makes a single
+        subprocess invocation.
+        """
+        now = time.monotonic()
+        cached = getattr(self, "_panes_cache", None)
+        if cached is not None and now - cached[0] < 0.1:
+            return cached[1]
+        try:
+            r = subprocess.run(["wezterm", "cli", "list", "--format", "json"],
+                               capture_output=True, text=True,
+                               timeout=1.5, check=True)
+            data = json.loads(r.stdout)
+            if not isinstance(data, list):
+                data = []
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+            data = []
+        self._panes_cache = (now, data)
+        return data
+
+    def _wezterm_window_index(self):
+        """{mux_window_id -> (Wnck.Window, active_tab_id)} built from the live
+        X11 wezterm windows. The wezterm-side title prefix
+        'wez:<window_id>:<active_tab_id> ' supplies both halves."""
+        out = {}
+        for w in self.screen.get_windows():
+            if (w.get_class_instance_name() or "").lower() != WEZTERM_INST:
+                continue
+            m = WEZTERM_TITLE_PREFIX_RE.match(w.get_name() or "")
+            if m:
+                out[int(m.group(1))] = (w, int(m.group(2)))
+        return out
 
     def server_time(self):
         # A current X server timestamp keeps mutter's focus-stealing
@@ -729,12 +830,32 @@ class Switcher(Gtk.Window):
         """Return (ordered current-ws rows, all live wids).
 
         Reads the live Wnck window list (kept current via X events), so it
-        spawns nothing. Rows are (wid, instance, title, geometry, vmax, hmax,
-        vis), where vis is one of "full"/"partial"/"hidden".
+        spawns nothing X-side. Wezterm tabs are discovered via a short
+        `wezterm cli list` and replace their parent X11 window in the list,
+        so each tab is a first-class slot citizen. Rows are (wid, instance,
+        title, geometry, vmax, hmax, vis); wid is "0x..." for windows and
+        "wt:<pane_id>" for tabs.
         """
+        # Wezterm tab discovery. Failure (no wezterm, timeout, etc.) yields
+        # no tabs and leaves the wezterm X11 windows visible as-is.
+        panes = self._wezterm_panes()
+        wez_windows = self._wezterm_window_index() if panes else {}
+        # One row per (window_id, tab_id); pick the active pane in each tab
+        # so split panes still resolve to a single switchable entry.
+        tab_panes = {}
+        for p in panes:
+            key = (p.get("window_id"), p.get("tab_id"))
+            if key not in tab_panes or p.get("is_active"):
+                tab_panes[key] = p
+        wez_parent_xids = {wez_windows[wid][0].get_xid()
+                           for (wid, _tid) in tab_panes
+                           if wid in wez_windows}
+
         # Build the bottom-to-top stack of unminimised windows on this
         # workspace so each candidate can be compared against everything
         # currently drawn above it. Minimised windows can't occlude anything.
+        # Wezterm parents stay in the stack so their visibility informs the
+        # tab rows, but are filtered out of the row list below.
         stacked = []
         for w in self.screen.get_windows_stacked():
             if w.is_skip_tasklist() or w.is_minimized():
@@ -742,19 +863,28 @@ class Switcher(Gtk.Window):
             wsobj = w.get_workspace()
             if wsobj is None or wsobj.get_number() != ws:
                 continue
-            stacked.append((wid_str(w), w.get_geometry()))
+            stacked.append((w.get_xid(), wid_str(w), w.get_geometry()))
         vis_map = {}
-        for i, (wid, geo) in enumerate(stacked):
-            vis_map[wid] = _classify_visibility(geo,
-                                                [r[1] for r in stacked[i+1:]])
+        parent_vis = {}
+        for i, (xid, wid, geo) in enumerate(stacked):
+            higher = [g for _x, _w, g in stacked[i+1:]]
+            v = _classify_visibility(geo, higher)
+            vis_map[wid] = v
+            if xid in wez_parent_xids:
+                parent_vis[xid] = v
 
         rows, all_ids = [], []
+        # Drop the stale parent->xid mapping; repopulate as tabs are emitted
+        # so closed tabs and renamed wezterm windows don't leak entries.
+        self._tab_parent = {}
         for w in self.screen.get_windows():
             if w.is_skip_tasklist():
                 continue
             title = w.get_name() or ""
             if title == OWN_TITLE:
                 continue
+            if w.get_xid() in wez_parent_xids:
+                continue                # tabs replace the wezterm parent row
             wid = wid_str(w)
             all_ids.append(wid)
             wsobj = w.get_workspace()
@@ -768,6 +898,38 @@ class Switcher(Gtk.Window):
                              w.is_maximized_vertically(),
                              w.is_maximized_horizontally(),
                              vis))
+
+        # Wezterm tab rows. Append after the windows; slot mapping will hand
+        # each new tab the lowest-empty slot on first sighting.
+        for (winid, tab_id), pane in tab_panes.items():
+            entry = wez_windows.get(winid)
+            if entry is None:
+                continue
+            parent, active_tab_id = entry
+            wsobj = parent.get_workspace()
+            if wsobj is None or wsobj.get_number() != ws:
+                continue
+            if parent.is_minimized():
+                continue
+            wid = TAB_WID_PREFIX + str(pane["pane_id"])
+            self._tab_parent[wid] = parent.get_xid()
+            all_ids.append(wid)
+            gx, gy, gw, gh = parent.get_geometry()
+            # tab_title is the user-set title (wezterm cli set-tab-title);
+            # otherwise fall back to the pane's program-set title.
+            title = pane.get("tab_title") or pane.get("title") or ""
+            pvis = parent_vis.get(parent.get_xid(), "full")
+            # A tab is visible only when its parent window is visible AND
+            # this is the active tab in that window. Other tabs sit behind
+            # the active one and read as hidden.
+            if pvis == "hidden":
+                tab_vis = "hidden"
+            else:
+                tab_vis = "full" if tab_id == active_tab_id else "hidden"
+            rows.append((wid, WEZTERM_INST, title, (gx, gy, gw, gh),
+                         parent.is_maximized_vertically(),
+                         parent.is_maximized_horizontally(),
+                         tab_vis))
         return rows, all_ids
 
     def window_indicator(self, geo, vmax, hmax):
@@ -837,9 +999,9 @@ class Switcher(Gtk.Window):
             if wid not in live:
                 del self.tags[wid]
 
-    def _emit_window(self, rec, slot_i, active):
+    def _emit_window(self, rec, slot_i, active_wid):
         wid, inst, title, geo, vmax, hmax, vis = rec
-        if active and int(wid, 16) == active:
+        if active_wid and wid == active_wid:
             self._active_geo = geo
         tag = self.tags.get(wid, "")
         markup = pango(title)
@@ -852,7 +1014,7 @@ class Switcher(Gtk.Window):
         return self.add_row(slot_text, mode_key, digit, icon, markup, search,
                             mode_vis=vis, wid=wid)
 
-    def _emit_group(self, win_rows, slots, keep_wid, active,
+    def _emit_group(self, win_rows, slots, keep_wid, active_wid,
                     placeholders=True, ws=None):
         # One workspace's rows: a fixed row per slot (blank placeholder when
         # empty, unless placeholders is False) followed by any unslotted
@@ -864,22 +1026,22 @@ class Switcher(Gtk.Window):
         for i in range(12):
             wid = slots[i]
             if wid and wid in by_id:
-                r = self._emit_window(by_id[wid], i, active)
+                r = self._emit_window(by_id[wid], i, active_wid)
                 r.ws_group = ws
                 if wid == keep_wid:
                     keep_row = r
-                if active and int(wid, 16) == active:
+                if active_wid and wid == active_wid:
                     active_row = r
             elif placeholders:
                 self.add_row(f"F{i + 1}", "", "", None, "", "", selectable=False)
         for tup in win_rows:
             wid = tup[0]
             if wid not in slot_of:
-                r = self._emit_window(tup, None, active)
+                r = self._emit_window(tup, None, active_wid)
                 r.ws_group = ws
                 if wid == keep_wid:
                     keep_row = r
-                if active and int(wid, 16) == active:
+                if active_wid and wid == active_wid:
                     active_row = r
         return keep_row, active_row
 
@@ -931,10 +1093,10 @@ class Switcher(Gtk.Window):
         win_rows, all_ids = self.list_windows(ws)
         self._prune_tags(all_ids)
         self.slots = self.refresh_slots(ws, [r[0] for r in win_rows])
-        active = self.active_xid()
+        active_wid = self.active_wid_str()
         self._active_geo = None
         keep_row, active_row = self._emit_group(win_rows, self.slots,
-                                                keep_wid, active)
+                                                keep_wid, active_wid)
         self._finish_select(keep_row, active_row, select_active)
 
     def _ws_label(self, ws):
@@ -956,7 +1118,7 @@ class Switcher(Gtk.Window):
         # and the newly-occupied group's divider would stay hidden.
         self.screen.force_update()
         cur = self.current_ws()
-        active = self.active_xid()
+        active_wid = self.active_wid_str()
         self._active_geo = None
         keep_row = active_row = None
         all_ids = []
@@ -966,7 +1128,7 @@ class Switcher(Gtk.Window):
             slots = self.refresh_slots(ws, [r[0] for r in win_rows])
             if ws == cur:
                 self.slots = slots          # F-keys still target the current ws
-            kr, ar = self._emit_group(win_rows, slots, keep_wid, active,
+            kr, ar = self._emit_group(win_rows, slots, keep_wid, active_wid,
                                       placeholders=False, ws=ws)
             keep_row = keep_row or kr
             active_row = active_row or ar
@@ -1259,6 +1421,32 @@ class Switcher(Gtk.Window):
         row = self.listbox.get_selected_row()
         return getattr(row, "wid", None) if row else None
 
+    def _wezterm_cli(self, *args):
+        # Best-effort fire-and-forget invocation; tab activate/close should
+        # never block frofi (a stuck mux must not freeze the popup).
+        try:
+            subprocess.run(["wezterm", "cli", *args],
+                           timeout=1.5, check=False,
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    def _activate_wid(self, wid, t=None):
+        """Bring `wid` to focus. For tabs, switch wezterm to the pane first
+        and then raise the parent X11 window."""
+        if t is None:
+            t = self.server_time()
+        if is_tab_wid(wid):
+            self._wezterm_cli("activate-pane", "--pane-id", tab_pane_id(wid))
+            parent = self.wnck_window(wid)
+            if parent is not None:
+                parent.activate(t)
+            return
+        w = self.wnck_window(wid)
+        if w is not None:
+            w.activate(t)
+
     def on_activate(self):
         if self.mode == "drun":
             row = self.listbox.get_selected_row()
@@ -1270,9 +1458,7 @@ class Switcher(Gtk.Window):
         t = self.server_time()
         self.hide_switcher()
         if wid:
-            w = self.wnck_window(wid)
-            if w is not None:
-                w.activate(t)
+            self._activate_wid(wid, t)
 
     def focus_selected(self):
         # Activate the window but keep the switcher up, so the user can preview
@@ -1282,12 +1468,14 @@ class Switcher(Gtk.Window):
         wid = self.selected_wid()
         if not wid:
             return
-        w = self.wnck_window(wid)
-        if w is None:
-            return
-        w.activate(self.server_time())
-
-        def reassert():
+        self._activate_wid(wid)
+        # Switching a tab leaves the parent X11 window's stacking unchanged,
+        # so window-stacking-changed never fires and the visibility badge
+        # would stay stale. Force a rebuild once wezterm has processed the
+        # activate-pane and the new title prefix has landed.
+        if is_tab_wid(wid):
+            self._panes_cache = None
+            self.schedule(80, lambda: self.rebuild_current(keep_wid=wid))
             win = self.get_window()
             if win is not None and self.get_mapped():
                 win.raise_()
@@ -1308,9 +1496,7 @@ class Switcher(Gtk.Window):
             wid = self.slots[n - 1]
             t = self.server_time()
             self.hide_switcher()
-            w = self.wnck_window(wid)
-            if w is not None:
-                w.activate(t)
+            self._activate_wid(wid, t)
 
     def close_selected(self):
         row = self.listbox.get_selected_row()
@@ -1321,9 +1507,12 @@ class Switcher(Gtk.Window):
         # down the list, rather than jumping back to the active/first row.
         vis = self.visible_rows()
         idx = vis.index(row) if row in vis else 0
-        w = self.wnck_window(wid)
-        if w is not None:
-            w.close(self.server_time())
+        if is_tab_wid(wid):
+            self._wezterm_cli("kill-pane", "--pane-id", tab_pane_id(wid))
+        else:
+            w = self.wnck_window(wid)
+            if w is not None:
+                w.close(self.server_time())
 
         def after():
             self.rebuild_current()
@@ -1650,9 +1839,7 @@ def run_daemon():
             except ValueError:
                 return
             if 1 <= n <= 12 and slots[n - 1]:
-                w = win.wnck_window(slots[n - 1])
-                if w is not None:
-                    w.activate(win.server_time())
+                win._activate_wid(slots[n - 1])
         elif parts[0] == "switch-ws" and len(parts) == 2:
             try:
                 delta = int(parts[1])
