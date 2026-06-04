@@ -83,6 +83,15 @@ CSS = b"""
 #frofi row label { color: #002b36; font-size: 12pt; }
 #frofi row:selected { background-color: #586875; }
 #frofi row:selected label { color: #eee8d5; }
+/* Sibling rows: belong to the same chrome window / tmux workspace
+   pool as the selection. A thick blue bar on the left plus a tinted
+   background reads clearly even at a glance. */
+#frofi row.sibling {
+    background-image: linear-gradient(
+        to right,
+        #268bd2 0, #268bd2 6px,
+        rgba(38, 139, 210, 0.22) 6px, rgba(38, 139, 210, 0.22) 100%);
+}
 #frofi .slot { color: #586875; font-family: monospace; }
 #frofi row:selected .slot { color: #eee8d5; }
 #frofi .mode { color: #586875; font-family: monospace; }
@@ -101,17 +110,21 @@ CSS = b"""
 """
 
 HINT_WINDOW = ("<b>Ctrl+Enter</b> focus   <b>Del</b> close   "
+               "<b>Ctrl+T</b> tag   <b>Ctrl+F</b> F-keys   <b>Tab</b> cycle\n"
                "<b>Alt+←/→</b> move ws   <b>Alt+↑/↓</b> reorder   "
-               "<b>Ctrl+Alt+←/→</b> switch ws\n"
+               "<b>Ctrl+Alt+←/→</b> switch ws   "
                "<b>←/→</b> tile   <b>Super+↑/↓</b> max/float   "
-               "<b>Super+←/→</b> monitor   <b>Ctrl+T</b> tag   "
-               "<b>Ctrl+F</b> F-keys   <b>Tab</b> cycle")
+               "<b>Super+←/→</b> monitor\n"
+               "<b>Super+T</b> new term   <b>Super+C</b> new chrome   "
+               "<b>Super+D</b> detach   <b>Super+R</b> reattach")
 HINT_WS = ("<b>Ctrl+Enter</b> focus   <b>Del</b> close   "
+           "<b>Ctrl+T</b> tag   <b>Ctrl+F</b> F-keys   <b>Tab</b> cycle\n"
            "<b>Alt+←/→</b> move ws   <b>Alt+↑/↓</b> reorder   "
-           "<b>Ctrl+Alt+←/→</b> switch ws\n"
+           "<b>Ctrl+Alt+←/→</b> switch ws   "
            "<b>←/→</b> tile   <b>Super+↑/↓</b> max/float   "
-           "<b>Super+←/→</b> monitor   <b>Ctrl+T</b> tag   "
-           "<b>Ctrl+F</b> F-keys   <b>Tab</b> cycle")
+           "<b>Super+←/→</b> monitor\n"
+           "<b>Super+T</b> new term   <b>Super+C</b> new chrome   "
+           "<b>Super+D</b> detach   <b>Super+R</b> reattach")
 HINT_DRUN = ("<b>Enter</b> launch   <b>Ctrl+Alt+←/→</b> switch ws   "
              "<b>Ctrl+R</b> refresh   <b>Tab</b> cycle")
 HINT_HELP = "<b>Tab</b> cycle   <b>Esc</b> close   GNOME custom shortcuts (read-only)"
@@ -604,6 +617,10 @@ class Switcher(Gtk.Window):
         self.connect("key-press-event", self.on_key)
         self.connect("map-event", self.on_map)
         self.listbox.connect("row-activated", lambda _b, _r: self.on_activate())
+        # Highlight every other row backed by the same parent X11 window
+        # as the selection -- makes the "all these tabs/sessions are
+        # tucked behind one host" relationship visible at a glance.
+        self.listbox.connect("row-selected", self._on_row_selected)
         # Visibility classification depends on the live X stack, so re-render
         # rows whenever it shifts (e.g. Ctrl+Enter raises a window while the
         # popup stays open). The rebuild is cheap and only runs when mapped.
@@ -1133,6 +1150,13 @@ class Switcher(Gtk.Window):
         host_attached_session = None
         host_tty = None
         wez_parent_xids = set()
+        # Per-session host map: session_name -> X11 xid of the wezterm
+        # actually attached to it (the *first* if mirrored). Built once
+        # so that each session row can store its real parent rather than
+        # falling back to "the workspace's first host" -- which silently
+        # routes tile/move ops to the wrong window when sessions are
+        # detached or mirrored.
+        ws_session_host = {}
         for winid, parent in wez_windows.items():
             wsobj = parent.get_workspace()
             if wsobj is None or wsobj.get_number() != ws:
@@ -1144,6 +1168,7 @@ class Switcher(Gtk.Window):
             if not attached.startswith(ws_prefix):
                 continue                # attached to another workspace's pool
             wez_parent_xids.add(parent.get_xid())
+            ws_session_host.setdefault(attached, parent.get_xid())
             if host_xid is None:
                 host_xid = parent.get_xid()
                 host_geo = parent.get_geometry()
@@ -1331,8 +1356,6 @@ class Switcher(Gtk.Window):
         # falls back to (0, 0, 0, 0) which renders the floating-window
         # indicator and disables the monitor digit.
         sessions = self._tmux_sessions() if panes is not None else []
-        geo = host_geo if host_geo is not None else (0, 0, 0, 0)
-        vmax, hmax = host_vmax, host_hmax
         for sess in sessions:
             m = TMUX_SESSION_RE.match(sess["name"])
             if not m:
@@ -1340,16 +1363,32 @@ class Switcher(Gtk.Window):
             if int(m.group(1)) != ws:
                 continue
             wid = TMUX_WID_PREFIX + sess["name"]
-            if host_xid is not None:
-                self._session_parent[wid] = host_xid
-            all_ids.append(wid)
-            is_attached = (sess["name"] == host_attached_session)
-            if host_xid is None or host_vis == "hidden":
-                vis = "hidden"
+            own_host_xid = ws_session_host.get(sess["name"])
+            if own_host_xid is not None:
+                self._session_parent[wid] = own_host_xid
+                # Match geometry and tile state to the row's own host so
+                # tile/max/move-monitor operations stay accurate even
+                # when the workspace has multiple hosts (post-detach).
+                for w in self.screen.get_windows():
+                    if w.get_xid() == own_host_xid:
+                        geo = w.get_geometry()
+                        vmax_row = w.is_maximized_vertically()
+                        hmax_row = w.is_maximized_horizontally()
+                        break
+                else:
+                    geo = host_geo or (0, 0, 0, 0)
+                    vmax_row, hmax_row = host_vmax, host_hmax
+                row_vis = "full" if host_vis != "hidden" else "hidden"
             else:
-                vis = "full" if is_attached else "hidden"
+                # Detached session: no host, fall back to the workspace's
+                # first wezterm geometry for the tile-indicator visual but
+                # mark the row hidden so it doesn't read as "live".
+                geo = host_geo or (0, 0, 0, 0)
+                vmax_row, hmax_row = host_vmax, host_hmax
+                row_vis = "hidden"
+            all_ids.append(wid)
             rows.append((wid, WEZTERM_INST, sess["title"], geo,
-                         vmax, hmax, vis))
+                         vmax_row, hmax_row, row_vis))
 
         # Chrome tab rows: one per (X11 window, CDP tab) pair. Only the
         # active tab of a visible parent reads as visible; everything else
@@ -1453,6 +1492,16 @@ class Switcher(Gtk.Window):
         markup = pango(title)
         if tag:
             markup += f"  <span color='#8ab4f8'>[{pango(tag)}]</span>"
+        # Warn when a tmux session row is mirrored across multiple
+        # wezterm hosts; that's a state-leak the user almost never wants
+        # and reattach is the way out.
+        if is_tmux_wid(wid):
+            name = tmux_session_name(wid)
+            mirrors = sum(1 for s in self._tmux_clients().values()
+                          if s == name)
+            if mirrors > 1:
+                markup += (f"  <span color='#dc322f' weight='bold'>"
+                           f"⚠ {mirrors}×</span>")
         slot_text = f"F{slot_i + 1}" if slot_i is not None else ""
         mode_key, digit = self.window_indicator(geo, vmax, hmax)
         search = title + " " + tag
@@ -1867,6 +1916,53 @@ class Switcher(Gtk.Window):
         row = self.listbox.get_selected_row()
         return getattr(row, "wid", None) if row else None
 
+    def _parent_xid_of(self, wid):
+        """X11 parent xid that "owns" the row's wid -- the host wezterm
+        for tm:, the host chrome for cr:, the X11 window itself for hex
+        wids. Used by ops that need to operate on the parent."""
+        if not wid:
+            return None
+        if is_tmux_wid(wid):
+            return self._session_parent.get(wid)
+        if is_chrome_wid(wid):
+            return self._chrome_parent.get(wid)
+        try:
+            return int(wid, 16)
+        except ValueError:
+            return None
+
+    def _sibling_group_of(self, wid):
+        """Group key for the "these belong together" sibling-highlight.
+        Chrome tabs are grouped per-window (host xid). Tmux sessions are
+        grouped per-workspace-pool: each session lives in its own host,
+        but visually the user thinks of all ws<N>- sessions as the same
+        bucket. Regular X11 rows have no siblings."""
+        if not wid:
+            return None
+        if is_tmux_wid(wid):
+            ws = self._ws_of_session(tmux_session_name(wid))
+            return f"tm:ws{ws}" if ws is not None else None
+        if is_chrome_wid(wid):
+            xid = self._chrome_parent.get(wid)
+            return f"cr:{xid}" if xid is not None else None
+        return None
+
+    def _on_row_selected(self, _box, row):
+        # The selected row already has its own :selected styling. Every
+        # other row sharing its sibling group gets the .sibling class.
+        group = None
+        if row is not None:
+            wid = getattr(row, "wid", None)
+            group = self._sibling_group_of(wid) if wid else None
+        for r in self.listbox.get_children():
+            ctx = r.get_style_context()
+            if (group is not None and r is not row
+                    and getattr(r, "wid", None)
+                    and self._sibling_group_of(r.wid) == group):
+                ctx.add_class("sibling")
+            else:
+                ctx.remove_class("sibling")
+
     def _ws_of_session(self, name):
         m = TMUX_SESSION_RE.match(name)
         return int(m.group(1)) if m else None
@@ -1881,6 +1977,28 @@ class Switcher(Gtk.Window):
             t = self.server_time()
         if is_tmux_wid(wid):
             name = tmux_session_name(wid)
+            # Refuse to mirror: if the session is already attached to
+            # some wezterm we know about, raise that wezterm instead of
+            # switching a different host (would silently move the user)
+            # or spawning a new one (would add a mirror).
+            clients = self._tmux_clients()
+            attached_ttys = [tty for tty, sess in clients.items()
+                             if sess == name]
+            if attached_ttys:
+                panes = self._wezterm_panes()
+                wez_windows = self._wezterm_window_index()
+                tty_to_winid = {p["tty_name"]: p["window_id"]
+                                for p in panes
+                                if p.get("tty_name")
+                                and p.get("window_id") in wez_windows}
+                for tty in attached_ttys:
+                    winid = tty_to_winid.get(tty)
+                    host = wez_windows.get(winid) if winid is not None else None
+                    if host is not None:
+                        host.activate(t)
+                        return
+                # Attached but the host wezterm wasn't found via our
+                # title-prefix lookup. Fall through to switch/spawn.
             ws = self._ws_of_session(name)
             tty = self._session_client_tty.get(ws) if ws is not None else None
             if tty:
@@ -2246,6 +2364,247 @@ class Switcher(Gtk.Window):
         else:
             self.schedule(180, lambda: self.rebuild_windows(keep_wid=wid))
 
+    def _detach_selected(self):
+        """Move the selected virtual-window row into a new X11 window of
+        its own, then half-tile source and new window side-by-side on the
+        same monitor."""
+        wid = self.selected_wid()
+        if not wid:
+            return
+        if is_tmux_wid(wid):
+            self._detach_tmux_session(wid)
+        elif is_chrome_wid(wid):
+            self._detach_chrome_tab(wid)
+
+    def _match_src_geometry(self, src, dst):
+        """Move/resize dst so it covers the same pixels as src. The user
+        moves whichever window they want from there; detach itself just
+        ensures the new window is a faithful clone of the source's
+        geometry so it's reachable and sized usefully."""
+        if dst is None or src is None:
+            return
+        if src.get_xid() not in {w.get_xid()
+                                 for w in self.screen.get_windows()}:
+            return
+        gx, gy, gw, gh = src.get_geometry()
+        dst.unmaximize()
+        self._move_resize(dst, gx, gy, gw, gh)
+
+    def _wait_for_new_window(self, pre_xids, inst_filter, on_found,
+                             attempts=15):
+        """Poll Wnck until a window whose class-instance starts with
+        inst_filter and whose xid is not in pre_xids appears; call
+        on_found(window) with it. Used by detach handlers that depend on
+        Chrome/wezterm finishing their startup."""
+        def settle(attempt=0):
+            self.screen.force_update()
+            for w in self.screen.get_windows():
+                if w.get_xid() in pre_xids:
+                    continue
+                if not (w.get_class_instance_name() or "") \
+                        .lower().startswith(inst_filter):
+                    continue
+                on_found(w)
+                return False
+            if attempt < attempts:
+                self.schedule(100, lambda: settle(attempt + 1))
+            return False
+        self.schedule(120, settle)
+
+    def _detach_tmux_session(self, wid):
+        name = tmux_session_name(wid)
+        base = self._ws_of_session(name)
+        if base is None:
+            return
+        # Detach only makes sense when the source has somewhere to switch
+        # to. Without a fallback, "detach" would just spawn another mirror
+        # of the same session, which is what dug us into the four-mirror
+        # state earlier; refuse instead.
+        fallback = next(
+            (s["name"] for s in self._tmux_sessions()
+             if s["name"] != name
+             and self._ws_of_session(s["name"]) == base),
+            None)
+        if fallback is None:
+            return
+        src_window = None
+        src_tty = self._session_client_tty.get(base)
+        if src_tty:
+            panes = self._wezterm_panes()
+            for winid, parent in self._wezterm_window_index().items():
+                wsobj = parent.get_workspace()
+                if wsobj is None or wsobj.get_number() != base:
+                    continue
+                for p in panes:
+                    if (p.get("window_id") == winid
+                            and p.get("is_active")
+                            and p.get("tty_name") == src_tty):
+                        src_window = parent
+                        break
+                if src_window is not None:
+                    break
+            attached = self._tmux_clients().get(src_tty)
+            if attached == name:
+                self._tmux("switch-client", "-c", src_tty,
+                           "-t", fallback)
+        pre_xids = {w.get_xid() for w in self.screen.get_windows()
+                    if (w.get_class_instance_name() or "")
+                    .lower() == WEZTERM_INST}
+        self.hide_switcher()
+        try:
+            subprocess.Popen(
+                ["wezterm", "start", "--",
+                 "tmux", "attach", "-t", name],
+                cwd=os.path.expanduser("~"),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True)
+        except OSError:
+            return
+        self._wait_for_new_window(
+            pre_xids, WEZTERM_INST,
+            lambda new_win: self._match_src_geometry(src_window, new_win))
+
+    def _detach_chrome_tab(self, wid):
+        try:
+            tid = int(chrome_target_id(wid))
+        except ValueError:
+            return
+        # Detach only makes sense when the source window has other tabs
+        # to keep showing. Detaching the only tab in a window would just
+        # move that tab to a new window and close the source -- same
+        # number of windows, no side-by-side gain.
+        target_id_str = chrome_target_id(wid)
+        snap = self._chrome_snapshot()
+        src_winid = next((t.get("windowId") for t in (snap.get("tabs") or [])
+                          if str(t.get("id")) == target_id_str), None)
+        if src_winid is None:
+            return
+        if sum(1 for t in (snap.get("tabs") or [])
+               if t.get("windowId") == src_winid) <= 1:
+            return
+        src_window = self.wnck_window(wid)
+        pre_xids = {w.get_xid() for w in self.screen.get_windows()
+                    if (w.get_class_instance_name() or "")
+                    .lower().startswith(CHROME_INST)}
+        self.hide_switcher()
+        # windowId omitted -> chrome.windows.create({tabId}) detaches.
+        self._chrome_call({"action": "move_tab", "tabId": tid})
+        self._chrome_cache = None
+        self._wait_for_new_window(
+            pre_xids, CHROME_INST,
+            lambda new_win: self._match_src_geometry(src_window, new_win))
+
+    def _reattach_selected(self):
+        """Inverse of detach: take a lone tab/session out of its solo host
+        and merge it into the workspace's most-populated peer host. No-op
+        when there is no other host to merge into."""
+        wid = self.selected_wid()
+        if not wid:
+            return
+        if is_tmux_wid(wid):
+            self._reattach_tmux_session(wid)
+        elif is_chrome_wid(wid):
+            self._reattach_chrome_tab(wid)
+
+    def _reattach_chrome_tab(self, wid):
+        try:
+            tid = int(chrome_target_id(wid))
+        except ValueError:
+            return
+        snap = self._chrome_snapshot()
+        tabs = snap.get("tabs") or []
+        target_id_str = chrome_target_id(wid)
+        src_winid = next((t.get("windowId") for t in tabs
+                          if str(t.get("id")) == target_id_str), None)
+        if src_winid is None:
+            return
+        # Lone-tab check: the source CDP window has exactly this one tab.
+        if sum(1 for t in tabs if t.get("windowId") == src_winid) != 1:
+            return
+        # Restrict to chrome windows on the current workspace.
+        ws = self.current_ws()
+        ws_cdp_ids = set()
+        for w in self.screen.get_windows():
+            if not (w.get_class_instance_name() or "") \
+                    .lower().startswith(CHROME_INST):
+                continue
+            wsobj = w.get_workspace()
+            if wsobj is None or wsobj.get_number() != ws:
+                continue
+            if w.is_minimized():
+                continue
+            cdp_id = self._chrome_xid_to_cdp.get(w.get_xid())
+            if cdp_id is not None:
+                ws_cdp_ids.add(cdp_id)
+        if src_winid not in ws_cdp_ids or len(ws_cdp_ids) < 2:
+            return
+        counts = {}
+        for t in tabs:
+            twin = t.get("windowId")
+            if twin in ws_cdp_ids and twin != src_winid:
+                counts[twin] = counts.get(twin, 0) + 1
+        if not counts:
+            return
+        dest_winid = max(counts, key=counts.get)
+        self._chrome_call({"action": "move_tab",
+                           "tabId": tid, "windowId": dest_winid})
+        self._chrome_cache = None
+        self.hide_switcher()
+
+    def _reattach_tmux_session(self, wid):
+        name = tmux_session_name(wid)
+        ws = self._ws_of_session(name)
+        if ws is None:
+            return
+        ws_prefix = f"ws{ws}-"
+        # Gather (host_window, host_tty, attached_session) for every
+        # wezterm host on this workspace that's hosting a ws<N>- session.
+        panes = self._wezterm_panes()
+        wez_windows = self._wezterm_window_index()
+        tmux_clients = self._tmux_clients()
+        ws_hosts = []
+        for winid, parent in wez_windows.items():
+            wsobj = parent.get_workspace()
+            if wsobj is None or wsobj.get_number() != ws:
+                continue
+            host_tty = None
+            for p in panes:
+                if (p.get("window_id") == winid
+                        and p.get("is_active")
+                        and p.get("tty_name") in tmux_clients):
+                    host_tty = p["tty_name"]
+                    break
+            if host_tty is None:
+                continue
+            sess = tmux_clients[host_tty]
+            if sess.startswith(ws_prefix):
+                ws_hosts.append((parent, host_tty, sess))
+        if len(ws_hosts) < 2:
+            return
+        # Lone check: exactly one host attached to this session. If the
+        # session is mirrored across multiple wezterms (common after
+        # repeated detaches without a fallback), bail rather than pick
+        # one mirror to detach and leave the rest hanging.
+        hosts_for_name = [h for h in ws_hosts if h[2] == name]
+        if len(hosts_for_name) != 1:
+            return
+        src = hosts_for_name[0]
+        dest = next((h for h in ws_hosts if h is not src), None)
+        if dest is None:
+            return
+        _, dest_tty, _ = dest
+        _, src_tty, _ = src
+        # Switch destination host to this session, then drop the source
+        # client so its wezterm exits. Destination's previous session
+        # remains in the pool (detached) and reachable via frofi.
+        self._tmux("switch-client", "-c", dest_tty, "-t", name)
+        self._tmux("detach-client", "-t", src_tty)
+        self._panes_cache = None
+        self._tmux_cache = None
+        self.hide_switcher()
+
     def switch_ws(self, delta):
         target = self.current_ws() + delta   # clamp, no wraparound
         if target < 0 or target >= self.num_ws():
@@ -2496,6 +2855,12 @@ class Switcher(Gtk.Window):
                     return True
                 if key == Gdk.KEY_Down:
                     self.set_window_mode("window")
+                    return True
+                if key in (Gdk.KEY_d, Gdk.KEY_D):
+                    self._detach_selected()
+                    return True
+                if key in (Gdk.KEY_r, Gdk.KEY_R):
+                    self._reattach_selected()
                     return True
                 if key in (Gdk.KEY_t, Gdk.KEY_T):
                     self.hide_switcher()
