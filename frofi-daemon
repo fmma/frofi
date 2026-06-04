@@ -713,7 +713,12 @@ class Switcher(Gtk.Window):
         if cached is not None and now - cached[0] < 0.1:
             return cached[1]
         try:
-            r = subprocess.run(["wezterm", "cli", "list", "--format", "json"],
+            # --no-auto-start: when no wezterm gui/mux-server is running,
+            # `wezterm cli list` otherwise spawns a wezterm-mux-server itself
+            # (~2.5s) -- that blows past our subprocess timeout on first Super
+            # press of a fresh session and leaves a stray mux-server behind.
+            r = subprocess.run(["wezterm", "cli", "--no-auto-start",
+                                "list", "--format", "json"],
                                capture_output=True, text=True,
                                timeout=1.5, check=True)
             data = json.loads(r.stdout)
