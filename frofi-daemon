@@ -214,6 +214,18 @@ _xlib.XGetErrorText.argtypes = [ctypes.c_void_p, ctypes.c_int,
 _xlib.XGetErrorText.restype = ctypes.c_int
 _xlib.XSetErrorHandler.argtypes = [ctypes.c_void_p]
 _xlib.XSetErrorHandler.restype = ctypes.c_void_p
+_xlib.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+_xlib.XInternAtom.restype = ctypes.c_ulong
+_xlib.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+                              ctypes.c_long, ctypes.c_void_p]
+_xlib.XSendEvent.restype = ctypes.c_int
+_xlib.XFlush.argtypes = [ctypes.c_void_p]
+_xlib.XFlush.restype = ctypes.c_int
+_xlib.XChangeProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                   ctypes.c_ulong, ctypes.c_ulong,
+                                   ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_void_p, ctypes.c_int]
+_xlib.XChangeProperty.restype = ctypes.c_int
 
 LEFT_SUPER_KEYCODE = 133            # the physical Super key that emits F13
 _F13_KEYSYM = 0xffca
@@ -271,12 +283,36 @@ class _XKeyEvent(ctypes.Structure):
     ]
 
 
+class _XClientMessageData(ctypes.Union):
+    _fields_ = [('b', ctypes.c_byte * 20),
+                ('s', ctypes.c_short * 10),
+                ('l', ctypes.c_long * 5)]
+
+
+class _XClientMessageEvent(ctypes.Structure):
+    _fields_ = [('type', ctypes.c_int),
+                ('serial', ctypes.c_ulong),
+                ('send_event', ctypes.c_int),
+                ('display', ctypes.c_void_p),
+                ('window', ctypes.c_ulong),
+                ('message_type', ctypes.c_ulong),
+                ('format', ctypes.c_int),
+                ('data', _XClientMessageData)]
+
+
 class _XEvent(ctypes.Union):
     # XEvent's union is 192 bytes on 64-bit; pad to that so XNextEvent never
     # writes past the end whatever event type arrives.
     _fields_ = [('type', ctypes.c_int),
                 ('xkey', _XKeyEvent),
+                ('xclient', _XClientMessageEvent),
                 ('_pad', ctypes.c_long * 24)]
+
+
+_CLIENT_MESSAGE = 33
+_SUBSTRUCTURE_NOTIFY_MASK = 1 << 19
+_SUBSTRUCTURE_REDIRECT_MASK = 1 << 20
+_PROP_MODE_REPLACE = 0
 
 
 _KEY_PRESS = 2
@@ -971,6 +1007,44 @@ class Switcher(Gtk.Window):
             except Exception:
                 pass
         return Gtk.get_current_event_time()
+
+    def activate_xid(self, xid, t):
+        """Raise xid via _NET_ACTIVE_WINDOW with source=2 (pager).
+
+        Wnck.Window.activate() sends source=1 (application), which
+        mutter's focus-stealing prevention rejects whenever the
+        currently-focused window has a fresher _NET_WM_USER_TIME than
+        the timestamp we pass -- exactly what chrome triggers when a
+        background tab updates its user-time (e.g. cijoe opening a
+        results tab). source=2 is documented for pagers/taskbars and
+        bypasses the check; frofi is one.
+        """
+        if not self._xdpy or not xid:
+            return
+        atom = _xlib.XInternAtom(self._xdpy,
+                                  b"_NET_ACTIVE_WINDOW", 0)
+        ev = _XEvent()
+        ev.xclient.type = _CLIENT_MESSAGE
+        ev.xclient.send_event = 1
+        ev.xclient.display = self._xdpy
+        ev.xclient.window = ctypes.c_ulong(xid).value
+        ev.xclient.message_type = atom
+        ev.xclient.format = 32
+        ev.xclient.data.l[0] = 2          # source: pager
+        ev.xclient.data.l[1] = ctypes.c_long(t).value
+        ev.xclient.data.l[2] = 0
+        ev.xclient.data.l[3] = 0
+        ev.xclient.data.l[4] = 0
+        mask = _SUBSTRUCTURE_NOTIFY_MASK | _SUBSTRUCTURE_REDIRECT_MASK
+        root = _xlib.XDefaultRootWindow(self._xdpy)
+        _xlib.XSendEvent(self._xdpy, root, 0, mask, ctypes.byref(ev))
+        _xlib.XSync(self._xdpy, 0)
+
+    def activate_wnck(self, w, t):
+        """Activate a Wnck.Window via _NET_ACTIVE_WINDOW source=2."""
+        if w is None:
+            return
+        self.activate_xid(w.get_xid(), t)
 
     # --- icons ---------------------------------------------------------------
     def icon_image(self, name):
@@ -1995,7 +2069,7 @@ class Switcher(Gtk.Window):
                     winid = tty_to_winid.get(tty)
                     host = wez_windows.get(winid) if winid is not None else None
                     if host is not None:
-                        host.activate(t)
+                        self.activate_wnck(host, t)
                         return
                 # Attached but the host wezterm wasn't found via our
                 # title-prefix lookup. Fall through to switch/spawn.
@@ -2005,7 +2079,21 @@ class Switcher(Gtk.Window):
                 self._tmux("switch-client", "-c", tty, "-t", name)
                 host = self.wnck_window(wid)
                 if host is not None:
-                    host.activate(t)
+                    self.activate_wnck(host, t)
+                else:
+                    # _session_parent isn't populated yet (first rebuild after
+                    # a wezterm-title transient, e.g. a focus loss to chrome).
+                    # Find the host directly from the live wezterm panes so
+                    # the press doesn't silently miss.
+                    panes = self._wezterm_panes()
+                    wez_windows = self._wezterm_window_index()
+                    for p in panes:
+                        if p.get("tty_name") != tty:
+                            continue
+                        w = wez_windows.get(p.get("window_id"))
+                        if w is not None:
+                            self.activate_wnck(w, t)
+                            break
             else:
                 # Orphan session: no host wezterm on its workspace. Spawn
                 # one running `tmux attach`; it inherits the current X11
@@ -2029,11 +2117,11 @@ class Switcher(Gtk.Window):
             self._chrome_call({"action": "activate", "tabId": tid})
             host = self.wnck_window(wid)
             if host is not None:
-                host.activate(t)
+                self.activate_wnck(host, t)
             return
         w = self.wnck_window(wid)
         if w is not None:
-            w.activate(t)
+            self.activate_wnck(w, t)
 
     def on_activate(self):
         if self.mode == "drun":
