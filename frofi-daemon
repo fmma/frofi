@@ -115,7 +115,7 @@ HINT_WINDOW = ("<b>Ctrl+Enter</b> focus   <b>Del</b> close   "
                "<b>Ctrl+Alt+←/→</b> switch ws   "
                "<b>←/→</b> tile   <b>Super+↑/↓</b> max/float   "
                "<b>Super+←/→</b> monitor\n"
-               "<b>Super+T</b> new term   <b>Super+C</b> new chrome   "
+               "<b>Super+Q</b> new term   <b>Super+W</b> new chrome   "
                "<b>Super+D</b> detach   <b>Super+R</b> reattach")
 HINT_WS = ("<b>Ctrl+Enter</b> focus   <b>Del</b> close   "
            "<b>Ctrl+T</b> tag   <b>Ctrl+F</b> F-keys   <b>Tab</b> cycle\n"
@@ -123,7 +123,7 @@ HINT_WS = ("<b>Ctrl+Enter</b> focus   <b>Del</b> close   "
            "<b>Ctrl+Alt+←/→</b> switch ws   "
            "<b>←/→</b> tile   <b>Super+↑/↓</b> max/float   "
            "<b>Super+←/→</b> monitor\n"
-           "<b>Super+T</b> new term   <b>Super+C</b> new chrome   "
+           "<b>Super+Q</b> new term   <b>Super+W</b> new chrome   "
            "<b>Super+D</b> detach   <b>Super+R</b> reattach")
 HINT_DRUN = ("<b>Enter</b> launch   <b>Ctrl+Alt+←/→</b> switch ws   "
              "<b>Ctrl+R</b> refresh   <b>Tab</b> cycle")
@@ -2862,7 +2862,7 @@ class Switcher(Gtk.Window):
                 if key in (Gdk.KEY_r, Gdk.KEY_R):
                     self._reattach_selected()
                     return True
-                if key in (Gdk.KEY_t, Gdk.KEY_T):
+                if key in (Gdk.KEY_q, Gdk.KEY_Q):
                     self.hide_switcher()
                     subprocess.Popen(
                         [os.path.expanduser("~/.local/bin/wezterm-spawn")],
@@ -2872,7 +2872,7 @@ class Switcher(Gtk.Window):
                         stderr=subprocess.DEVNULL,
                         start_new_session=True)
                     return True
-                if key in (Gdk.KEY_c, Gdk.KEY_C):
+                if key in (Gdk.KEY_w, Gdk.KEY_W):
                     self.hide_switcher()
                     subprocess.Popen(
                         [os.path.expanduser("~/.local/bin/chrome-spawn")],
