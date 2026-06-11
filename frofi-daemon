@@ -933,6 +933,44 @@ class Switcher(Gtk.Window):
                 out[parts[0]] = parts[1]
         return out
 
+    def _wezterm_pid_for_client_tty(self, tty):
+        """Walk from the tmux client process at <tty> up the process tree
+        to find a wezterm-gui (or wezterm) ancestor. Returns its pid or
+        None. Used to map a tmux client tty to a wezterm window when the
+        daemon's `wezterm cli` socket can't see that window (multiple
+        independent wezterm-gui processes, no shared mux server)."""
+        raw = self._tmux("list-clients", "-F",
+                         "#{client_pid}\t#{client_tty}", capture=True) or ""
+        pid = None
+        for line in raw.splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) == 2 and parts[1] == tty:
+                try:
+                    pid = int(parts[0])
+                except ValueError:
+                    pid = None
+                break
+        if pid is None:
+            return None
+        try:
+            for _ in range(16):
+                with open(f"/proc/{pid}/comm") as f:
+                    comm = f.read().strip()
+                if comm in ("wezterm-gui", "wezterm"):
+                    return pid
+                ppid = None
+                with open(f"/proc/{pid}/status") as f:
+                    for line in f:
+                        if line.startswith("PPid:"):
+                            ppid = int(line.split()[1])
+                            break
+                if not ppid or ppid <= 1:
+                    return None
+                pid = ppid
+        except (OSError, ValueError):
+            return None
+        return None
+
     # --- chrome native-host client ---------------------------------------
     def _chrome_call(self, req, timeout=0.3):
         """One-shot unix-socket RPC to chrome-frofi-host. Returns parsed
@@ -2071,8 +2109,26 @@ class Switcher(Gtk.Window):
                     if host is not None:
                         self.activate_wnck(host, t)
                         return
-                # Attached but the host wezterm wasn't found via our
-                # title-prefix lookup. Fall through to switch/spawn.
+                # Title-prefix lookup didn't find the host: the wezterm
+                # owning that client is a separate wezterm-gui process the
+                # daemon's `wezterm cli` socket can't see. Map tty ->
+                # wezterm-gui PID via /proc and raise the matching X11
+                # window instead. If that also fails, bail without
+                # spawning -- a fresh `wezterm start -- tmux attach`
+                # would just mirror the session.
+                wezterm_pids = set()
+                for tty in attached_ttys:
+                    wpid = self._wezterm_pid_for_client_tty(tty)
+                    if wpid is not None:
+                        wezterm_pids.add(wpid)
+                if wezterm_pids:
+                    for w in self.screen.get_windows():
+                        if (w.get_class_instance_name() or "").lower() != WEZTERM_INST:
+                            continue
+                        if w.get_pid() in wezterm_pids:
+                            self.activate_wnck(w, t)
+                            return
+                return
             ws = self._ws_of_session(name)
             tty = self._session_client_tty.get(ws) if ws is not None else None
             if tty:
