@@ -117,6 +117,7 @@ HINT_WINDOW = ("<b>Ctrl+Enter</b> focus   <b>Del</b> close   "
                "<b>←/→</b> tile   <b>Super+↑/↓</b> max/float   "
                "<b>Super+←/→</b> monitor\n"
                "<b>Super+Q</b> new term   <b>Super+W</b> new chrome   "
+               "<b>Super+E</b> new code   "
                "<b>Super+D</b> detach   <b>Super+R</b> reattach")
 HINT_WS = ("<b>Ctrl+Enter</b> focus   <b>Del</b> close   "
            "<b>Ctrl+T</b> tag   <b>Ctrl+F</b> F-keys   <b>Tab</b> cycle\n"
@@ -125,6 +126,7 @@ HINT_WS = ("<b>Ctrl+Enter</b> focus   <b>Del</b> close   "
            "<b>←/→</b> tile   <b>Super+↑/↓</b> max/float   "
            "<b>Super+←/→</b> monitor\n"
            "<b>Super+Q</b> new term   <b>Super+W</b> new chrome   "
+           "<b>Super+E</b> new code   "
            "<b>Super+D</b> detach   <b>Super+R</b> reattach")
 HINT_DRUN = ("<b>Enter</b> launch   <b>Ctrl+Alt+←/→</b> switch ws   "
              "<b>Ctrl+R</b> refresh   <b>Tab</b> cycle")
@@ -2903,6 +2905,16 @@ class Switcher(Gtk.Window):
                     self.hide_switcher()
                     subprocess.Popen(
                         [os.path.expanduser("~/.local/bin/chrome-spawn")],
+                        cwd=os.path.expanduser("~"),
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True)
+                    return True
+                if key in (Gdk.KEY_e, Gdk.KEY_E):
+                    self.hide_switcher()
+                    subprocess.Popen(
+                        [os.path.expanduser("~/.local/bin/code-spawn")],
                         cwd=os.path.expanduser("~"),
                         stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL,
