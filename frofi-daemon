@@ -45,6 +45,9 @@ VISIBLE_ROWS = 12       # list viewport height, in rows (matches the slot count)
 RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
 SOCK_PATH = os.path.join(RUNTIME, "frofi.sock")
 LOCK_PATH = os.path.join(RUNTIME, "frofi.lock")
+STATE_DIR = (os.environ.get("XDG_STATE_HOME")
+             or os.path.expanduser("~/.local/state"))
+STATE_PATH = os.path.join(STATE_DIR, "frofi", "state.json")
 DEBUG = bool(os.environ.get("FROFI_DEBUG"))
 
 DESKTOP_DIRS = [
@@ -882,7 +885,9 @@ class Switcher(Gtk.Window):
         self.mode = "window"
         self.slot_map = {}          # ws -> 12-element slot list (in-memory)
         self.slots = [""] * 12      # current workspace's slots (view of above)
-        self.tags = {}              # wid -> tag, in-memory for the daemon's life
+        self.tags = {}              # wid -> tag, persisted across daemon restarts
+        self._state_save_timer = None
+        self._load_state()
         self.tag_target = None      # wid being tagged in tag mode
         # Long-lived resolver for chrome X11 <-> CDP windowId. Owns the
         # persistent focus-pin map; refreshed on demand via
@@ -1643,14 +1648,16 @@ class Switcher(Gtk.Window):
     def refresh_slots(self, ws, ordered_ids):
         """Prune dead slots and fill empties from the live window list.
 
-        Mutates the workspace's slot list in place, so the assignment lives as
-        long as the daemon does. A daemon restart starts from empty slots.
+        Mutates the workspace's slot list in place. State is persisted via
+        _mark_dirty, so the assignment lives across daemon restarts.
         """
         slots = self.slots_for(ws)
         cur = set(ordered_ids)
+        changed = False
         for i in range(12):
             if slots[i] and slots[i] not in cur:
                 slots[i] = ""
+                changed = True
         in_slot = {s for s in slots if s}
         for wid in ordered_ids:
             if wid in in_slot:
@@ -1659,7 +1666,10 @@ class Switcher(Gtk.Window):
                 if not slots[i]:
                     slots[i] = wid
                     in_slot.add(wid)
+                    changed = True
                     break
+        if changed:
+            self._mark_dirty()
         return slots
 
     def _prep_rebuild(self):
@@ -1667,17 +1677,89 @@ class Switcher(Gtk.Window):
         # workspaces that no longer exist and snapshot the monitor geometry
         # the indicator uses to label half-tiles and the monitor digit.
         nws = self.num_ws()
-        for k in [k for k in self.slot_map if k >= nws]:
+        dead = [k for k in self.slot_map if k >= nws]
+        for k in dead:
             del self.slot_map[k]
+        if dead:
+            self._mark_dirty()
         disp = Gdk.Display.get_default()
         self._monitors = [disp.get_monitor(i).get_geometry()
                           for i in range(disp.get_n_monitors())]
 
     def _prune_tags(self, all_ids):
         live = set(all_ids)
-        for wid in list(self.tags):
-            if wid not in live:
-                del self.tags[wid]
+        dead = [wid for wid in self.tags if wid not in live]
+        for wid in dead:
+            del self.tags[wid]
+        if dead:
+            self._mark_dirty()
+
+    # --- persistence --------------------------------------------------------
+    # Slot assignments and tags survive daemon restarts: WIDs stay stable for
+    # the life of each X11 window, so a stop/start of the daemon reattaches to
+    # the same windows. Stale entries (reboots, window closes between runs)
+    # get pruned naturally on the next rebuild.
+    def _load_state(self):
+        try:
+            with open(STATE_PATH) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+        slots = data.get("slots")
+        if isinstance(slots, dict):
+            for ws_str, wids in slots.items():
+                try:
+                    ws = int(ws_str)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(wids, list) or len(wids) != 12:
+                    continue
+                try:
+                    self.slot_map[ws] = [int(w) if w else "" for w in wids]
+                except (TypeError, ValueError):
+                    continue
+        tags = data.get("tags")
+        if isinstance(tags, dict):
+            for wid_str, tag in tags.items():
+                try:
+                    self.tags[int(wid_str)] = str(tag)
+                except (TypeError, ValueError):
+                    continue
+
+    def _save_state(self):
+        self._state_save_timer = None
+        data = {
+            "version": 1,
+            "slots": {
+                str(ws): [int(w) if w else None for w in slots]
+                for ws, slots in self.slot_map.items()
+            },
+            "tags": {str(wid): tag for wid, tag in self.tags.items()},
+        }
+        try:
+            os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+            tmp = STATE_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f, separators=(",", ":"))
+            os.replace(tmp, STATE_PATH)
+        except OSError:
+            pass
+        return False
+
+    def _mark_dirty(self):
+        if self._state_save_timer is not None:
+            return
+        # 500ms debounce coalesces the burst of mutations a single rebuild
+        # triggers (refresh_slots, _prep_rebuild, _prune_tags) into one write.
+        self._state_save_timer = GLib.timeout_add(500, self._save_state)
+
+    def _flush_state(self):
+        if self._state_save_timer is not None:
+            GLib.source_remove(self._state_save_timer)
+            self._state_save_timer = None
+            self._save_state()
 
     def _emit_window(self, rec, slot_i, active_wid):
         wid, inst, title, geo, vmax, hmax, vis = rec
@@ -2736,6 +2818,7 @@ class Switcher(Gtk.Window):
         dst = src + delta
         if 0 <= dst <= 11:
             slots[src], slots[dst] = slots[dst], slots[src]
+            self._mark_dirty()
             self.rebuild_current(keep_wid=wid)
 
     # --- inline tag editing --------------------------------------------------
@@ -2757,6 +2840,7 @@ class Switcher(Gtk.Window):
             self.tags[self.tag_target] = tag
         else:
             self.tags.pop(self.tag_target, None)
+        self._mark_dirty()
         wid = self.tag_target
         self.tag_target = None
         self.entry.set_text("")
@@ -3014,6 +3098,7 @@ def run_daemon():
     service.start()
 
     def shutdown():
+        win._flush_state()
         try:
             os.unlink(SOCK_PATH)
         except OSError:
