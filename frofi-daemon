@@ -36,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 
 OWN_TITLE = "frofi-daemon-window"
 WIDTH = 660
@@ -458,6 +459,102 @@ WEZTERM_TITLE_PREFIX_RE = re.compile(r"^wez:(\d+):(\d+) ")
 TMUX_SESSION_RE = re.compile(r"^ws(\d+)-")
 
 
+@dataclass(frozen=True)
+class WeztermHost:
+    """A wezterm X11 window that's currently hosting a tmux client.
+
+    Internally the registry identifies each host by (gui_pid,
+    mux_window_id) -- the only pair that's unique system-wide -- but
+    those are kept inside `WeztermHostRegistry.build` so callers see
+    only the resolved fields below.
+    """
+    wnck_window: object          # Wnck.Window (the X11 surface)
+    xid: int
+    tty: str                     # /dev/pts/N of the host pane
+    session: str                 # tmux session currently attached on `tty`
+    workspace: int               # X11 workspace number
+
+
+class WeztermHostRegistry:
+    """Per-rebuild snapshot of every wezterm window that's currently
+    hosting a tmux client. Single source of truth for every caller in
+    the daemon that needs to cross the wezterm <-> tmux boundary.
+
+    Built fresh per `_wezterm_hosts()` call (microseconds; the underlying
+    panes/tmux data is 100ms-cached); callers ask for hosts by xid,
+    session, or workspace. Identity plumbing (pid + mux window_id +
+    title prefix + per-gui sockets) lives in `build` so future schema
+    changes touch only this class.
+    """
+
+    def __init__(self, hosts):
+        self._hosts = list(hosts)
+        self._by_xid = {h.xid: h for h in self._hosts}
+        # for_session picks the first host matching `name` (any will do
+        # for "raise to this session"); hosts_for_session returns all
+        # of them, used by callers that care about mirror count.
+        self._by_session = {}
+        for h in self._hosts:
+            self._by_session.setdefault(h.session, h)
+
+    @classmethod
+    def build(cls, screen, tmux_clients, panes):
+        """Inputs:
+            screen        wnck screen.
+            tmux_clients  {tty -> session_name} from `tmux list-clients`.
+            panes         pane dicts from `wezterm cli list` aggregated
+                          across every wezterm-gui socket, each tagged
+                          with `gui_pid`.
+        """
+        tty_by_key = {}
+        for p in panes:
+            key = (p.get("gui_pid"), p.get("window_id"))
+            if key[0] is None or key[1] is None:
+                continue
+            tty = p.get("tty_name")
+            if not tty:
+                continue
+            if p.get("is_active") or key not in tty_by_key:
+                tty_by_key[key] = tty
+        hosts = []
+        for w in screen.get_windows():
+            if (w.get_class_instance_name() or "").lower() != WEZTERM_INST:
+                continue
+            wsobj = w.get_workspace()
+            if wsobj is None:
+                continue
+            pid = w.get_pid()
+            if not pid:
+                continue
+            m = WEZTERM_TITLE_PREFIX_RE.match(w.get_name() or "")
+            if not m:
+                continue
+            mux_wid = int(m.group(1))
+            tty = tty_by_key.get((pid, mux_wid))
+            if tty is None:
+                continue
+            sess = tmux_clients.get(tty)
+            if sess is None:
+                continue
+            hosts.append(WeztermHost(
+                wnck_window=w, xid=w.get_xid(),
+                tty=tty, session=sess,
+                workspace=wsobj.get_number()))
+        return cls(hosts)
+
+    def on_workspace(self, ws):
+        return [h for h in self._hosts if h.workspace == ws]
+
+    def for_session(self, name):
+        return self._by_session.get(name)
+
+    def hosts_for_session(self, name):
+        return [h for h in self._hosts if h.session == name]
+
+    def for_xid(self, xid):
+        return self._by_xid.get(xid)
+
+
 def is_tmux_wid(wid):
     return isinstance(wid, str) and wid.startswith(TMUX_WID_PREFIX)
 
@@ -486,6 +583,222 @@ def is_chrome_wid(wid):
 
 def chrome_target_id(wid):
     return wid[len(CHROME_WID_PREFIX):]
+
+
+@dataclass(frozen=True)
+class ChromeTab:
+    """A single Chrome tab, materialized from the native host's snapshot.
+
+    `target_id` is the CDP tabId stringified -- that's what action
+    payloads ({"action":"move_tab","tabId":...}) and frofi wids
+    ("cr:<target_id>") both speak. `parent_xid` / `parent_cdp_id`
+    point at the chrome window hosting this tab, already resolved by
+    the registry's X11<->CDP matcher.
+    """
+    target_id: str
+    title: str
+    url: str
+    active: bool
+    parent_xid: int
+    parent_cdp_id: int
+    workspace: int
+
+
+@dataclass(frozen=True)
+class ChromeWindow:
+    """A Chrome X11 window with its resolved CDP windowId and tabs.
+
+    The (xid, cdp_id) pair is resolved by ChromeRegistry via the
+    persistent pin map first, then geometry, then active-tab title,
+    then arbitrary -- callers never see the resolution itself.
+    """
+    wnck_window: object          # Wnck.Window
+    xid: int
+    cdp_id: int
+    workspace: int
+    tabs: tuple                  # tuple of ChromeTab
+
+
+class ChromeRegistry:
+    """X11 chrome window <-> CDP windowId resolver.
+
+    Long-lived on the daemon: owns the persistent pin map of
+    focus-confirmed (X11 xid, CDP id) pairs and a refreshed snapshot
+    of resolved windows + tabs. Callers ask by xid, cdp_id, tab
+    target_id, or workspace; the identity scheme (pin-first, then
+    geometry, then title, then arbitrary) is confined to `rebuild`.
+
+    A pinned (x11, cdp) pair survives across rebuilds and gets evicted
+    only when the CDP window disappears or another xid claims its CDP
+    via focus. Without focus pinning, two maximized chromes on
+    different workspaces would share geometry and the per-workspace
+    tab lists would smear.
+    """
+
+    def __init__(self):
+        self._pin = {}                  # xid -> cdp_id, persistent
+        self._windows_by_xid = {}
+        self._windows_by_cdp = {}
+        self._tabs = {}                 # target_id -> ChromeTab
+
+    def rebuild(self, screen, snapshot, active_xid):
+        """Refresh from a CDP snapshot. Mutates the pin map: evicts
+        stale pins for non-live CDP ids; repins the (active X11, focused
+        CDP) pair when chrome reports a focused window and that xid is
+        a live chrome window."""
+        tabs_in = snapshot.get("tabs") or []
+        wins_in = snapshot.get("windows") or []
+        cdp_bounds = {}
+        for w in wins_in:
+            wid = w.get("id")
+            if (wid is None
+                    or "left" not in w or "top" not in w
+                    or "width" not in w or "height" not in w):
+                continue
+            cdp_bounds[wid] = (w["left"], w["top"], w["width"], w["height"])
+        # Evict stale pins.
+        live_cdp = set(cdp_bounds.keys())
+        for xid in [k for k, v in self._pin.items() if v not in live_cdp]:
+            del self._pin[xid]
+        # Repin (active X11, focused CDP) when both agree it's a chrome
+        # window. Two maximized chromes on different workspaces share
+        # their X11 geometry; only focus anchoring keeps the tab lists
+        # correctly partitioned by workspace.
+        focused_cdp = next((w["id"] for w in wins_in
+                            if w.get("focused")), None)
+        if focused_cdp is not None and active_xid is not None:
+            for w in screen.get_windows():
+                if w.get_xid() != active_xid:
+                    continue
+                if (w.get_class_instance_name() or "") \
+                        .lower().startswith(CHROME_INST):
+                    for old in [k for k, v in self._pin.items()
+                                if v == focused_cdp and k != active_xid]:
+                        del self._pin[old]
+                    self._pin[active_xid] = focused_cdp
+                break
+        # Collect chrome X11 windows.
+        chrome_x11 = []
+        for w in screen.get_windows():
+            if w.is_skip_tasklist():
+                continue
+            if not (w.get_class_instance_name() or "") \
+                    .lower().startswith(CHROME_INST):
+                continue
+            if w.is_minimized():
+                continue
+            chrome_x11.append(w)
+        # Group tabs by CDP windowId for the title-match fallback and
+        # for tab enumeration below.
+        cdp_by_window = {}
+        for t in tabs_in:
+            winid = t.get("windowId")
+            if winid is None:
+                continue
+            cdp_by_window.setdefault(winid, []).append(t)
+        # Resolve each X11 chrome window to a CDP windowId. used_cdp
+        # is global across the resolution sweep so two X11 windows
+        # never claim the same CDP.
+        used_cdp = set()
+        resolved = []
+        for x11w in chrome_x11:
+            xid = x11w.get_xid()
+            wsobj = x11w.get_workspace()
+            if wsobj is None:
+                continue
+            cdp_id = self._resolve_cdp(x11w, xid, cdp_bounds,
+                                       cdp_by_window, used_cdp)
+            if cdp_id is None:
+                continue
+            used_cdp.add(cdp_id)
+            resolved.append((x11w, xid, wsobj.get_number(), cdp_id))
+        # Materialize windows + tabs.
+        self._windows_by_xid = {}
+        self._windows_by_cdp = {}
+        self._tabs = {}
+        for x11w, xid, ws_num, cdp_id in resolved:
+            active_title = self._active_tab_title(x11w)
+            tabs = []
+            for t in cdp_by_window.get(cdp_id, []):
+                tid = t.get("id")
+                if tid is None:
+                    continue
+                tabs.append(ChromeTab(
+                    target_id=str(tid),
+                    title=t.get("title") or "",
+                    url=t.get("url") or "",
+                    active=(t.get("title") == active_title),
+                    parent_xid=xid,
+                    parent_cdp_id=cdp_id,
+                    workspace=ws_num))
+            cw = ChromeWindow(
+                wnck_window=x11w, xid=xid, cdp_id=cdp_id,
+                workspace=ws_num, tabs=tuple(tabs))
+            self._windows_by_xid[xid] = cw
+            self._windows_by_cdp[cdp_id] = cw
+            for tab in tabs:
+                self._tabs[tab.target_id] = tab
+
+    @staticmethod
+    def _active_tab_title(x11w):
+        """Strip the " - Google Chrome" suffix from a chrome X11 window's
+        _NET_WM_NAME to recover the active tab's title. The result is
+        used both as a tie-break in X11<->CDP resolution and as the
+        "which tab is visible" check when emitting tab rows."""
+        x11_title = x11w.get_name() or ""
+        if x11_title.endswith(CHROME_TITLE_SUFFIX):
+            return x11_title[:-len(CHROME_TITLE_SUFFIX)]
+        return x11_title
+
+    def _resolve_cdp(self, x11w, xid, cdp_bounds, cdp_by_window, used_cdp):
+        """X11 chrome window -> CDP windowId via pin, geometry, title,
+        or arbitrary, in that order. Returns None when nothing matches
+        (no live CDP windows left)."""
+        # Priority 1: focus-pinned, if still live and unclaimed.
+        pinned = self._pin.get(xid)
+        if pinned is not None and pinned in cdp_bounds and pinned not in used_cdp:
+            return pinned
+        # Priority 2: geometry within 50 px. Two maximized chromes on
+        # the same monitor share coordinates so this only disambiguates
+        # when sizes/positions actually differ.
+        gx, gy, _gw, _gh = x11w.get_geometry()
+        best_cdp = None
+        best_d = 50
+        for cdp_id, (cl, ct, _cw, _ch) in cdp_bounds.items():
+            if cdp_id in used_cdp:
+                continue
+            d = abs(cl - gx) + abs(ct - gy)
+            if d <= best_d:
+                best_d = d
+                best_cdp = cdp_id
+        if best_cdp is not None:
+            return best_cdp
+        # Priority 3: active-tab-title match.
+        active_title = self._active_tab_title(x11w)
+        for cdp_id, tlist in cdp_by_window.items():
+            if cdp_id in used_cdp:
+                continue
+            if any(t.get("title") == active_title for t in tlist):
+                return cdp_id
+        # Priority 4: take any remaining CDP. The user will fix it the
+        # next time they focus this window -- focus events repin.
+        for cdp_id in cdp_bounds:
+            if cdp_id not in used_cdp:
+                return cdp_id
+        return None
+
+    def windows_on_workspace(self, ws):
+        return [w for w in self._windows_by_xid.values()
+                if w.workspace == ws]
+
+    def window_for_xid(self, xid):
+        return self._windows_by_xid.get(xid)
+
+    def window_for_cdp(self, cdp_id):
+        return self._windows_by_cdp.get(cdp_id)
+
+    def tab(self, target_id):
+        return self._tabs.get(target_id)
 
 
 def pango(s):
@@ -569,22 +882,11 @@ class Switcher(Gtk.Window):
         self.slots = [""] * 12      # current workspace's slots (view of above)
         self.tags = {}              # wid -> tag, in-memory for the daemon's life
         self.tag_target = None      # wid being tagged in tag mode
-        # Session wid (e.g. "tm:ws3-1234") -> X11 xid of the host wezterm
-        # window on its workspace, plus the tty_name of the host pane (used
-        # to direct `tmux switch-client -c <tty>` at the right client). Set
-        # by list_windows during rebuild.
-        self._session_parent = {}     # wid -> xid
-        self._session_client_tty = {} # ws -> client_tty for that workspace's host
-        # Chrome tab wid -> parent X11 xid (for tile/max/move-to-monitor
-        # routing) and full title text (used as a stable identifier when
-        # the live target_id->title lookup loses the row mid-rebuild).
-        self._chrome_parent = {}
-        # Persistent X11-xid -> CDP-window-id mapping for chrome windows.
-        # Geometry alone can't distinguish two chrome windows maximized on
-        # the same monitor on different workspaces; this map gets pinned
-        # on every rebuild from "focused X11 chrome == focused CDP" and
-        # falls back to geometry/arbitrary when nothing is pinned.
-        self._chrome_xid_to_cdp = {}
+        # Long-lived resolver for chrome X11 <-> CDP windowId. Owns the
+        # persistent focus-pin map; refreshed on demand via
+        # _chrome_registry() which calls rebuild against the current
+        # snapshot.
+        self.chrome_registry = ChromeRegistry()
         self._active_geo = None     # focused window geometry, for monitor pick
         self._row_h = None          # measured row height, for the 12-row viewport
         self._vis_groups = set()    # ws groups with a visible window (ws mode)
@@ -688,112 +990,103 @@ class Switcher(Gtk.Window):
         active = self.active_xid()
         if active is None:
             return ""
-        focus_win = None
-        for w in self.screen.get_windows():
-            if w.get_xid() == active:
-                focus_win = w
-                break
-        if focus_win is None:
-            return ""
-        if (focus_win.get_class_instance_name() or "").lower() == WEZTERM_INST:
-            m = WEZTERM_TITLE_PREFIX_RE.match(focus_win.get_name() or "")
-            if m is not None:
-                winid = int(m.group(1))
-                tty = None
-                for p in self._wezterm_panes():
-                    if (p.get("window_id") == winid
-                            and p.get("is_active")
-                            and p.get("tty_name")):
-                        tty = p["tty_name"]
-                        break
-                if tty:
-                    sess = self._tmux_clients().get(tty)
-                    if sess:
-                        return TMUX_WID_PREFIX + sess
-        if (focus_win.get_class_instance_name() or "").lower().startswith(CHROME_INST):
-            # Use the pinned X11->CDP map plus the snapshot's per-tab
-            # active flag. Falls back to active-tab-title only when the
-            # window's CDP id hasn't been pinned yet (first time we see
-            # it without a focus event having confirmed the pairing).
-            cdp_id = self._chrome_xid_to_cdp.get(active)
-            tabs = self._chrome_tabs()
-            if cdp_id is not None:
-                for t in tabs:
-                    if t["window_id"] == cdp_id and t["active"]:
-                        return CHROME_WID_PREFIX + t["id"]
-            x11_title = focus_win.get_name() or ""
-            active_title = (x11_title[:-len(CHROME_TITLE_SUFFIX)]
-                            if x11_title.endswith(CHROME_TITLE_SUFFIX)
-                            else x11_title)
-            for t in tabs:
-                if t["title"] == active_title:
-                    return CHROME_WID_PREFIX + t["id"]
+        host = self._wezterm_hosts().for_xid(active)
+        if host is not None:
+            return TMUX_WID_PREFIX + host.session
+        window = self._chrome_registry().window_for_xid(active)
+        if window is not None:
+            active_tab = next((t for t in window.tabs if t.active), None)
+            if active_tab is not None:
+                return CHROME_WID_PREFIX + active_tab.target_id
         return "0x%08x" % active
 
     def wnck_window(self, wid):
         # Virtual-window rows (tmux session, chrome tab) aren't X11 windows;
         # tile/max/move-monitor etc. need to operate on the parent X11
-        # window so the viewport gets the geometry change.
+        # window so the viewport gets the geometry change. The registries
+        # already hold the parent's wnck.Window, so return it directly
+        # instead of round-tripping through xid + screen scan.
         if is_tmux_wid(wid):
-            xid = self._session_parent.get(wid)
-        elif is_chrome_wid(wid):
-            xid = self._chrome_parent.get(wid)
-        else:
-            target = int(wid, 16)
-            for w in self.screen.get_windows():
-                if w.get_xid() == target:
-                    return w
-            return None
-        if xid is None:
-            return None
+            host = self._wezterm_hosts().for_session(tmux_session_name(wid))
+            return host.wnck_window if host is not None else None
+        if is_chrome_wid(wid):
+            tab = self._chrome_registry().tab(chrome_target_id(wid))
+            if tab is None:
+                return None
+            parent = self._chrome_registry().window_for_cdp(tab.parent_cdp_id)
+            return parent.wnck_window if parent is not None else None
+        target = int(wid, 16)
         for w in self.screen.get_windows():
-            if w.get_xid() == xid:
+            if w.get_xid() == target:
                 return w
         return None
 
     # --- wezterm CLI -----------------------------------------------------
-    def _wezterm_panes(self):
-        """Return wezterm CLI panes (list of dicts); [] on any failure.
+    def _wezterm_gui_sockets(self):
+        """Return [(pid, sock_path)] for every wezterm-gui process whose
+        socket lives in $XDG_RUNTIME_DIR/wezterm/. Each independent
+        wezterm-gui process owns its own gui-sock-<pid> file."""
+        base = os.path.join(
+            os.environ.get("XDG_RUNTIME_DIR",
+                           f"/run/user/{os.getuid()}"),
+            "wezterm")
+        out = []
+        try:
+            for name in os.listdir(base):
+                if not name.startswith("gui-sock-"):
+                    continue
+                try:
+                    pid = int(name[len("gui-sock-"):])
+                except ValueError:
+                    continue
+                if os.path.exists(f"/proc/{pid}"):
+                    out.append((pid, os.path.join(base, name)))
+        except OSError:
+            pass
+        return out
 
-        Each pane has window_id, tab_id, pane_id, is_active, title, tab_title.
-        A short timeout keeps the call from stalling rebuild on a wezterm
-        process that's frozen or being torn down. Result is cached for 100 ms
-        so one rebuild_ws sweep (N workspaces -> N+1 calls) makes a single
-        subprocess invocation.
+    def _wezterm_panes(self):
+        """Aggregate wezterm CLI panes across every wezterm-gui process.
+
+        Each pane dict carries the canonical fields (window_id, tab_id,
+        pane_id, is_active, title, tab_title, tty_name) plus an added
+        `gui_pid` so callers can disambiguate when multiple independent
+        wezterm-gui processes coexist, or when one process hosts several
+        windows. A short timeout per socket keeps a frozen process from
+        stalling rebuild; result is cached 100 ms so one rebuild_ws sweep
+        makes one subprocess invocation per gui.
         """
         now = time.monotonic()
         cached = getattr(self, "_panes_cache", None)
         if cached is not None and now - cached[0] < 0.1:
             return cached[1]
-        try:
-            # --no-auto-start: when no wezterm gui/mux-server is running,
-            # `wezterm cli list` otherwise spawns a wezterm-mux-server itself
-            # (~2.5s) -- that blows past our subprocess timeout on first Super
-            # press of a fresh session and leaves a stray mux-server behind.
-            r = subprocess.run(["wezterm", "cli", "--no-auto-start",
-                                "list", "--format", "json"],
-                               capture_output=True, text=True,
-                               timeout=1.5, check=True)
-            data = json.loads(r.stdout)
-            if not isinstance(data, list):
-                data = []
-        except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
-            data = []
-        self._panes_cache = (now, data)
-        return data
-
-    def _wezterm_window_index(self):
-        """{mux_window_id -> Wnck.Window} built from the live X11 wezterm
-        windows via the 'wez:<window_id>:...' title prefix set by
-        wezterm.lua."""
-        out = {}
-        for w in self.screen.get_windows():
-            if (w.get_class_instance_name() or "").lower() != WEZTERM_INST:
-                continue
-            m = WEZTERM_TITLE_PREFIX_RE.match(w.get_name() or "")
-            if m:
-                out[int(m.group(1))] = w
+        out = []
+        for pid, sock in self._wezterm_gui_sockets():
+            try:
+                env = os.environ.copy()
+                env["WEZTERM_UNIX_SOCKET"] = sock
+                # --no-auto-start: don't spawn a wezterm-mux-server for
+                # a socket whose gui process died mid-rebuild.
+                r = subprocess.run(["wezterm", "cli", "--no-auto-start",
+                                    "list", "--format", "json"],
+                                   env=env, capture_output=True, text=True,
+                                   timeout=1.5, check=True)
+                data = json.loads(r.stdout)
+                if isinstance(data, list):
+                    for pane in data:
+                        pane["gui_pid"] = pid
+                        out.append(pane)
+            except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+                pass
+        self._panes_cache = (now, out)
         return out
+
+    def _wezterm_hosts(self):
+        """Snapshot of every wezterm window hosting a tmux client. The
+        underlying data (panes, tmux clients) is already cached for
+        ~100ms, so repeated calls within one rebuild are cheap."""
+        return WeztermHostRegistry.build(
+            self.screen, self._tmux_clients(), self._wezterm_panes())
 
     # --- tmux CLI --------------------------------------------------------
     def _tmux(self, *args, capture=False):
@@ -922,7 +1215,13 @@ class Switcher(Gtk.Window):
         return Switcher._parse_ssh_host(candidates[0][1])
 
     def _tmux_clients(self):
-        """{client_tty -> session_name} for every attached tmux client."""
+        """{client_tty -> session_name} for every attached tmux client.
+        Cached 100 ms so a rebuild sweep makes one tmux call instead of
+        one per workspace (each WeztermHostRegistry.build consumes it)."""
+        now = time.monotonic()
+        cached = getattr(self, "_tmux_clients_cache", None)
+        if cached is not None and now - cached[0] < 0.1:
+            return cached[1]
         raw = self._tmux("list-clients", "-F",
                          "#{client_tty}\t#{client_session}",
                          capture=True) or ""
@@ -931,45 +1230,9 @@ class Switcher(Gtk.Window):
             parts = line.split("\t", 1)
             if len(parts) == 2 and parts[0]:
                 out[parts[0]] = parts[1]
+        self._tmux_clients_cache = (now, out)
         return out
 
-    def _wezterm_pid_for_client_tty(self, tty):
-        """Walk from the tmux client process at <tty> up the process tree
-        to find a wezterm-gui (or wezterm) ancestor. Returns its pid or
-        None. Used to map a tmux client tty to a wezterm window when the
-        daemon's `wezterm cli` socket can't see that window (multiple
-        independent wezterm-gui processes, no shared mux server)."""
-        raw = self._tmux("list-clients", "-F",
-                         "#{client_pid}\t#{client_tty}", capture=True) or ""
-        pid = None
-        for line in raw.splitlines():
-            parts = line.split("\t", 1)
-            if len(parts) == 2 and parts[1] == tty:
-                try:
-                    pid = int(parts[0])
-                except ValueError:
-                    pid = None
-                break
-        if pid is None:
-            return None
-        try:
-            for _ in range(16):
-                with open(f"/proc/{pid}/comm") as f:
-                    comm = f.read().strip()
-                if comm in ("wezterm-gui", "wezterm"):
-                    return pid
-                ppid = None
-                with open(f"/proc/{pid}/status") as f:
-                    for line in f:
-                        if line.startswith("PPid:"):
-                            ppid = int(line.split()[1])
-                            break
-                if not ppid or ppid <= 1:
-                    return None
-                pid = ppid
-        except (OSError, ValueError):
-            return None
-        return None
 
     # --- chrome native-host client ---------------------------------------
     def _chrome_call(self, req, timeout=0.3):
@@ -1007,33 +1270,14 @@ class Switcher(Gtk.Window):
         self._chrome_cache = (now, snap)
         return snap
 
-    def _chrome_tabs(self):
-        """List of {id, title, url, window_id, active} for every chrome tab."""
-        out = []
-        for t in self._chrome_snapshot().get("tabs") or []:
-            tid = t.get("id")
-            winid = t.get("windowId")
-            if tid is None or winid is None:
-                continue
-            out.append({"id": str(tid),
-                        "title": t.get("title") or "",
-                        "url": t.get("url") or "",
-                        "window_id": winid,
-                        "active": bool(t.get("active"))})
-        return out
-
-    def _chrome_windows(self):
-        """{cdp_window_id: (left, top, width, height)} from the snapshot.
-        Missing bounds (older extension version) yields an empty mapping
-        so the caller can fall back to title-matching."""
-        out = {}
-        for w in self._chrome_snapshot().get("windows") or []:
-            wid = w.get("id")
-            if (wid is None or "left" not in w or "top" not in w
-                    or "width" not in w or "height" not in w):
-                continue
-            out[wid] = (w["left"], w["top"], w["width"], w["height"])
-        return out
+    def _chrome_registry(self):
+        """Refresh the chrome registry against the current snapshot and
+        focused-window state, then return it. Cheap: the underlying
+        snapshot is 100ms-cached, and the resolution pass is O(windows
+        x cdp_ids), which is tiny in practice."""
+        self.chrome_registry.rebuild(
+            self.screen, self._chrome_snapshot(), self.active_xid())
+        return self.chrome_registry
 
     def server_time(self):
         # A current X server timestamp keeps mutter's focus-stealing
@@ -1237,174 +1481,38 @@ class Switcher(Gtk.Window):
         instance, title, geometry, vmax, hmax, vis); wid is "0x..." for
         plain X11 windows and "tm:<session>" for virtual windows.
         """
-        # Find this workspace's host wezterm window (if any) and which
-        # tmux session its pane is currently attached to.
-        panes = self._wezterm_panes()
-        wez_windows = self._wezterm_window_index() if panes else {}
-        tmux_clients = self._tmux_clients() if panes else {}
-        # window_id -> tty_name of the active pane (one pane per window in
-        # the tmux model, but the active-pane filter keeps things robust).
-        wez_tty = {}
-        for p in panes:
-            wid = p.get("window_id")
-            if wid in wez_windows and p.get("is_active") and p.get("tty_name"):
-                wez_tty[wid] = p["tty_name"]
-        # Only a wezterm window whose pane is attached to a tmux client
-        # *for this workspace's session pool* counts as a session host. A
-        # plain `wezterm` invocation has no tmux at all; a wezterm hosting
-        # a session that belongs to a different workspace (e.g. after a
-        # session rename) stays a regular row so the user can still see
-        # and act on it.
+        # Find this workspace's host wezterm windows (if any) via the
+        # registry. Only sessions named ws<ws>- count as part of this
+        # workspace's pool; hosts attached to another workspace's pool
+        # are ignored. The "primary" host is the first in iteration
+        # order; its geometry is the fallback for detached session rows
+        # that have no live host of their own.
         ws_prefix = f"ws{ws}-"
-        host_xid = None
-        host_geo = None
-        host_vmax = host_hmax = False
-        host_attached_session = None
-        host_tty = None
+        primary_geo = None
+        primary_vmax = primary_hmax = False
         wez_parent_xids = set()
-        # Per-session host map: session_name -> X11 xid of the wezterm
-        # actually attached to it (the *first* if mirrored). Built once
-        # so that each session row can store its real parent rather than
-        # falling back to "the workspace's first host" -- which silently
-        # routes tile/move ops to the wrong window when sessions are
-        # detached or mirrored.
-        ws_session_host = {}
-        for winid, parent in wez_windows.items():
-            wsobj = parent.get_workspace()
-            if wsobj is None or wsobj.get_number() != ws:
+        for h in self._wezterm_hosts().on_workspace(ws):
+            if not h.session.startswith(ws_prefix):
                 continue
-            tty = wez_tty.get(winid)
-            if not tty or tty not in tmux_clients:
-                continue                # plain wezterm, no tmux attached
-            attached = tmux_clients[tty]
-            if not attached.startswith(ws_prefix):
-                continue                # attached to another workspace's pool
-            wez_parent_xids.add(parent.get_xid())
-            ws_session_host.setdefault(attached, parent.get_xid())
-            if host_xid is None:
-                host_xid = parent.get_xid()
-                host_geo = parent.get_geometry()
-                host_vmax = parent.is_maximized_vertically()
-                host_hmax = parent.is_maximized_horizontally()
-                host_tty = tty
-                host_attached_session = attached
-        # Stash for actions: which client tty to direct switch-client at.
-        self._session_client_tty[ws] = host_tty
+            wez_parent_xids.add(h.xid)
+            if primary_geo is None:
+                primary_geo = h.wnck_window.get_geometry()
+                primary_vmax = h.wnck_window.is_maximized_vertically()
+                primary_hmax = h.wnck_window.is_maximized_horizontally()
 
-        # Chrome tab discovery. Each Chrome X11 window on this workspace is
-        # paired with its CDP window by matching the active tab title (the
-        # X11 title is "<active tab title> - Google Chrome"). When the
-        # match succeeds the X11 window joins chrome_parent_xids so its
-        # row is replaced by per-tab rows below.
-        chrome_x11 = []
-        for w in self.screen.get_windows():
-            if w.is_skip_tasklist():
-                continue
-            inst = (w.get_class_instance_name() or "").lower()
-            # Chrome embeds the user-data-dir into the WM_CLASS instance
-            # string for non-default profiles (e.g. "google-chrome (/path)"),
-            # so we accept any "google-chrome*" prefix rather than an exact
-            # match. The default-profile windows lack DevTools and just
-            # render as plain X11 rows.
-            if not inst.startswith(CHROME_INST):
-                continue
-            wsobj = w.get_workspace()
-            if wsobj is None or wsobj.get_number() != ws:
-                continue
-            if w.is_minimized():
-                continue
-            chrome_x11.append(w)
-        chrome_tabs = self._chrome_tabs() if chrome_x11 else []
-        cdp_by_window = {}
-        for t in chrome_tabs:
-            cdp_by_window.setdefault(t["window_id"], []).append(t)
-        cdp_bounds = self._chrome_windows()           # cdp_id -> (l,t,w,h)
-        # Persistent X11 -> CDP map: refresh against live windows and pin
-        # the (focused X11 chrome, focused CDP) pair each rebuild. Two
-        # maximized chrome windows on different workspaces share their
-        # X11 geometry, so anchoring via focus is the only way to keep
-        # the per-workspace tab lists correctly partitioned.
-        live_cdp_ids = set(cdp_bounds.keys())
-        for stale_xid in [k for k, v in self._chrome_xid_to_cdp.items()
-                          if v not in live_cdp_ids]:
-            del self._chrome_xid_to_cdp[stale_xid]
-        snap_windows = self._chrome_snapshot().get("windows") or []
-        focused_cdp = next((w["id"] for w in snap_windows
-                            if w.get("focused")), None)
-        active_xid = self.active_xid()
-        if focused_cdp is not None and active_xid is not None:
-            for w in self.screen.get_windows():
-                if w.get_xid() != active_xid:
-                    continue
-                if not (w.get_class_instance_name() or "") \
-                        .lower().startswith(CHROME_INST):
-                    break
-                # Confirmed: this xid hosts that CDP window. Clear any
-                # other xid pointing at the same CDP so the map stays 1:1.
-                for old_xid in [k for k, v in self._chrome_xid_to_cdp.items()
-                                if v == focused_cdp and k != active_xid]:
-                    del self._chrome_xid_to_cdp[old_xid]
-                self._chrome_xid_to_cdp[active_xid] = focused_cdp
-                break
-
-        chrome_x11_to_cdp = {}
-        used_cdp = set()
-        for x11w in chrome_x11:
-            xid = x11w.get_xid()
-            x11_title = x11w.get_name() or ""
-            active_title = (x11_title[:-len(CHROME_TITLE_SUFFIX)]
-                            if x11_title.endswith(CHROME_TITLE_SUFFIX)
-                            else x11_title)
-            # Priority 1: the pinned (focus-confirmed) mapping for this
-            # xid, if its target CDP is still live and unclaimed.
-            pinned = self._chrome_xid_to_cdp.get(xid)
-            if pinned is not None and pinned in cdp_bounds and pinned not in used_cdp:
-                used_cdp.add(pinned)
-                chrome_x11_to_cdp[xid] = (pinned, active_title)
-                continue
-            # Priority 2: geometry. Two maximized chromes on the same
-            # monitor share coordinates, so this only disambiguates when
-            # window sizes/positions actually differ.
-            gx, gy, _gw, _gh = x11w.get_geometry()
-            best_cdp = None
-            best_d = 50
-            for cdp_id, (cl, ct, _cw, _ch) in cdp_bounds.items():
-                if cdp_id in used_cdp:
-                    continue
-                d = abs(cl - gx) + abs(ct - gy)
-                if d <= best_d:
-                    best_d = d
-                    best_cdp = cdp_id
-            if best_cdp is not None:
-                used_cdp.add(best_cdp)
-                chrome_x11_to_cdp[xid] = (best_cdp, active_title)
-                continue
-            # Priority 3: title-match against active-tab.
-            matched = False
-            for cdp_id, tlist in cdp_by_window.items():
-                if cdp_id in used_cdp:
-                    continue
-                if any(t["title"] == active_title for t in tlist):
-                    used_cdp.add(cdp_id)
-                    chrome_x11_to_cdp[xid] = (cdp_id, active_title)
-                    matched = True
-                    break
-            if matched:
-                continue
-            # Priority 4: take any remaining CDP arbitrarily. The user
-            # will fix it the next time they focus this window — focus
-            # events repin the persistent map.
-            for cdp_id in cdp_bounds:
-                if cdp_id in used_cdp:
-                    continue
-                used_cdp.add(cdp_id)
-                chrome_x11_to_cdp[xid] = (cdp_id, active_title)
-                break
-        chrome_parent_xids = set(chrome_x11_to_cdp.keys())
+        # Chrome tab discovery: the registry resolves each X11 chrome
+        # window to a CDP windowId and groups tabs under it. Windows on
+        # this workspace get absorbed into per-tab rows below; their
+        # raw X11 row is skipped via chrome_parent_xids.
+        chrome_windows = self._chrome_registry().windows_on_workspace(ws)
+        chrome_parent_xids = {cw.xid for cw in chrome_windows}
 
         # Bottom-to-top stack on this workspace, used both for the regular
         # vis map and to compute each host wezterm/chrome parent's
         # visibility (which gates whether their attached rows read visible).
+        # Per-host visibility maps let each session/tab row reflect the
+        # state of its OWN parent, not the workspace's primary host
+        # (which matters after detach when multiple hosts share a ws).
         stacked = []
         for w in self.screen.get_windows_stacked():
             if w.is_skip_tasklist() or w.is_minimized():
@@ -1414,30 +1522,18 @@ class Switcher(Gtk.Window):
                 continue
             stacked.append((w.get_xid(), wid_str(w), w.get_geometry()))
         vis_map = {}
-        host_vis = "hidden"
+        wez_parent_vis = {}
         chrome_parent_vis = {}
         for i, (xid, wid, geo) in enumerate(stacked):
             higher = [g for _x, _w, g in stacked[i+1:]]
             v = _classify_visibility(geo, higher)
             vis_map[wid] = v
-            if xid == host_xid:
-                host_vis = v
+            if xid in wez_parent_xids:
+                wez_parent_vis[xid] = v
             if xid in chrome_parent_xids:
                 chrome_parent_vis[xid] = v
 
         rows, all_ids = [], []
-        # Repopulate every rebuild so a closed wezterm or a renamed session
-        # doesn't keep ghost entries pointing at dead xids.
-        self._session_parent = {
-            k: v for k, v in self._session_parent.items()
-            if v != host_xid                    # drop stale entries for ws
-        }
-        # Drop chrome parents from this workspace; new entries will be
-        # added with fresh target_ids as chrome rows emit below.
-        self._chrome_parent = {
-            k: v for k, v in self._chrome_parent.items()
-            if v not in chrome_parent_xids
-        }
         for w in self.screen.get_windows():
             if w.is_skip_tasklist():
                 continue
@@ -1467,36 +1563,28 @@ class Switcher(Gtk.Window):
         # workspace's sessions (all dim) so they remain reachable; geometry
         # falls back to (0, 0, 0, 0) which renders the floating-window
         # indicator and disables the monitor digit.
-        sessions = self._tmux_sessions() if panes is not None else []
+        sessions = self._tmux_sessions()
         for sess in sessions:
-            m = TMUX_SESSION_RE.match(sess["name"])
-            if not m:
-                continue
-            if int(m.group(1)) != ws:
+            if self._ws_of_session(sess["name"]) != ws:
                 continue
             wid = TMUX_WID_PREFIX + sess["name"]
-            own_host_xid = ws_session_host.get(sess["name"])
-            if own_host_xid is not None:
-                self._session_parent[wid] = own_host_xid
-                # Match geometry and tile state to the row's own host so
-                # tile/max/move-monitor operations stay accurate even
-                # when the workspace has multiple hosts (post-detach).
-                for w in self.screen.get_windows():
-                    if w.get_xid() == own_host_xid:
-                        geo = w.get_geometry()
-                        vmax_row = w.is_maximized_vertically()
-                        hmax_row = w.is_maximized_horizontally()
-                        break
-                else:
-                    geo = host_geo or (0, 0, 0, 0)
-                    vmax_row, hmax_row = host_vmax, host_hmax
-                row_vis = "full" if host_vis != "hidden" else "hidden"
+            own_host = self._wezterm_hosts().for_session(sess["name"])
+            if own_host is not None and own_host.workspace == ws:
+                # Match geometry, tile state, and visibility to the row's
+                # OWN host so per-host state stays accurate even when the
+                # workspace has multiple hosts (post-detach).
+                w = own_host.wnck_window
+                geo = w.get_geometry()
+                vmax_row = w.is_maximized_vertically()
+                hmax_row = w.is_maximized_horizontally()
+                own_vis = wez_parent_vis.get(own_host.xid, "full")
+                row_vis = "full" if own_vis != "hidden" else "hidden"
             else:
                 # Detached session: no host, fall back to the workspace's
-                # first wezterm geometry for the tile-indicator visual but
-                # mark the row hidden so it doesn't read as "live".
-                geo = host_geo or (0, 0, 0, 0)
-                vmax_row, hmax_row = host_vmax, host_hmax
+                # primary wezterm geometry for the tile-indicator visual
+                # but mark the row hidden so it doesn't read as "live".
+                geo = primary_geo or (0, 0, 0, 0)
+                vmax_row, hmax_row = primary_vmax, primary_hmax
                 row_vis = "hidden"
             all_ids.append(wid)
             rows.append((wid, WEZTERM_INST, sess["title"], geo,
@@ -1504,28 +1592,21 @@ class Switcher(Gtk.Window):
 
         # Chrome tab rows: one per (X11 window, CDP tab) pair. Only the
         # active tab of a visible parent reads as visible; everything else
-        # is dim. The wezterm-icon search key gives them a clean app icon
-        # via the existing icon_map ("google-chrome" maps to chrome.png).
-        for x11w in chrome_x11:
-            xid = x11w.get_xid()
-            if xid not in chrome_x11_to_cdp:
-                continue
-            winid, active_title = chrome_x11_to_cdp[xid]
-            tabs = cdp_by_window.get(winid, [])
-            gx, gy, gw, gh = x11w.get_geometry()
-            v_h = x11w.is_maximized_vertically()
-            h_h = x11w.is_maximized_horizontally()
-            pvis = chrome_parent_vis.get(xid, "full")
-            for t in tabs:
-                wid = CHROME_WID_PREFIX + t["id"]
-                self._chrome_parent[wid] = xid
+        # is dim. The CHROME_INST search key gives the row chrome's icon
+        # via the existing icon_map.
+        for cwin in chrome_windows:
+            gx, gy, gw, gh = cwin.wnck_window.get_geometry()
+            v_h = cwin.wnck_window.is_maximized_vertically()
+            h_h = cwin.wnck_window.is_maximized_horizontally()
+            pvis = chrome_parent_vis.get(cwin.xid, "full")
+            for tab in cwin.tabs:
+                wid = CHROME_WID_PREFIX + tab.target_id
                 all_ids.append(wid)
-                is_active = (t["title"] == active_title)
                 if pvis == "hidden":
                     tab_vis = "hidden"
                 else:
-                    tab_vis = "full" if is_active else "hidden"
-                rows.append((wid, CHROME_INST, t["title"] or t["url"],
+                    tab_vis = "full" if tab.active else "hidden"
+                rows.append((wid, CHROME_INST, tab.title or tab.url,
                              (gx, gy, gw, gh), v_h, h_h, tab_vis))
         return rows, all_ids
 
@@ -1609,8 +1690,7 @@ class Switcher(Gtk.Window):
         # and reattach is the way out.
         if is_tmux_wid(wid):
             name = tmux_session_name(wid)
-            mirrors = sum(1 for s in self._tmux_clients().values()
-                          if s == name)
+            mirrors = len(self._wezterm_hosts().hosts_for_session(name))
             if mirrors > 1:
                 markup += (f"  <span color='#dc322f' weight='bold'>"
                            f"⚠ {mirrors}×</span>")
@@ -2035,9 +2115,11 @@ class Switcher(Gtk.Window):
         if not wid:
             return None
         if is_tmux_wid(wid):
-            return self._session_parent.get(wid)
+            host = self._wezterm_hosts().for_session(tmux_session_name(wid))
+            return host.xid if host is not None else None
         if is_chrome_wid(wid):
-            return self._chrome_parent.get(wid)
+            tab = self._chrome_registry().tab(chrome_target_id(wid))
+            return tab.parent_xid if tab is not None else None
         try:
             return int(wid, 16)
         except ValueError:
@@ -2055,8 +2137,8 @@ class Switcher(Gtk.Window):
             ws = self._ws_of_session(tmux_session_name(wid))
             return f"tm:ws{ws}" if ws is not None else None
         if is_chrome_wid(wid):
-            xid = self._chrome_parent.get(wid)
-            return f"cr:{xid}" if xid is not None else None
+            tab = self._chrome_registry().tab(chrome_target_id(wid))
+            return f"cr:{tab.parent_xid}" if tab is not None else None
         return None
 
     def _on_row_selected(self, _box, row):
@@ -2079,6 +2161,26 @@ class Switcher(Gtk.Window):
         m = TMUX_SESSION_RE.match(name)
         return int(m.group(1)) if m else None
 
+    def _invalidate_tmux_caches(self):
+        """Clear the 100ms caches that mirror tmux/wezterm state so the
+        next registry build reads it fresh. Call after any tmux action
+        (kill, rename, switch-client, detach-client) that changes which
+        session is attached to which tty."""
+        self._panes_cache = None
+        self._tmux_cache = None
+        self._tmux_clients_cache = None
+
+    def _sibling_session_on_ws(self, exclude_name, ws):
+        """Pick any other tmux session in the same `ws<N>-` pool as the
+        excluded one. Used by close/move/detach handlers to retarget a
+        client before its session disappears so the host wezterm doesn't
+        exit out from under the user."""
+        return next(
+            (s["name"] for s in self._tmux_sessions()
+             if s["name"] != exclude_name
+             and self._ws_of_session(s["name"]) == ws),
+            None)
+
     def _activate_wid(self, wid, t=None):
         """Bring `wid` to focus. For a virtual window (tmux session) whose
         workspace still has a host wezterm, retarget that client via
@@ -2089,67 +2191,23 @@ class Switcher(Gtk.Window):
             t = self.server_time()
         if is_tmux_wid(wid):
             name = tmux_session_name(wid)
-            # Refuse to mirror: if the session is already attached to
-            # some wezterm we know about, raise that wezterm instead of
-            # switching a different host (would silently move the user)
-            # or spawning a new one (would add a mirror).
-            clients = self._tmux_clients()
-            attached_ttys = [tty for tty, sess in clients.items()
-                             if sess == name]
-            if attached_ttys:
-                panes = self._wezterm_panes()
-                wez_windows = self._wezterm_window_index()
-                tty_to_winid = {p["tty_name"]: p["window_id"]
-                                for p in panes
-                                if p.get("tty_name")
-                                and p.get("window_id") in wez_windows}
-                for tty in attached_ttys:
-                    winid = tty_to_winid.get(tty)
-                    host = wez_windows.get(winid) if winid is not None else None
-                    if host is not None:
-                        self.activate_wnck(host, t)
-                        return
-                # Title-prefix lookup didn't find the host: the wezterm
-                # owning that client is a separate wezterm-gui process the
-                # daemon's `wezterm cli` socket can't see. Map tty ->
-                # wezterm-gui PID via /proc and raise the matching X11
-                # window instead. If that also fails, bail without
-                # spawning -- a fresh `wezterm start -- tmux attach`
-                # would just mirror the session.
-                wezterm_pids = set()
-                for tty in attached_ttys:
-                    wpid = self._wezterm_pid_for_client_tty(tty)
-                    if wpid is not None:
-                        wezterm_pids.add(wpid)
-                if wezterm_pids:
-                    for w in self.screen.get_windows():
-                        if (w.get_class_instance_name() or "").lower() != WEZTERM_INST:
-                            continue
-                        if w.get_pid() in wezterm_pids:
-                            self.activate_wnck(w, t)
-                            return
+            registry = self._wezterm_hosts()
+            # Refuse to mirror: if the session is already attached, raise
+            # that wezterm rather than retargeting another host (would
+            # silently move the user) or spawning a new one (would add a
+            # mirror).
+            host = registry.for_session(name)
+            if host is not None:
+                self.activate_wnck(host.wnck_window, t)
                 return
+            # Session is detached. If this workspace still has a host
+            # wezterm, retarget it; otherwise spawn a fresh one.
             ws = self._ws_of_session(name)
-            tty = self._session_client_tty.get(ws) if ws is not None else None
-            if tty:
-                self._tmux("switch-client", "-c", tty, "-t", name)
-                host = self.wnck_window(wid)
-                if host is not None:
-                    self.activate_wnck(host, t)
-                else:
-                    # _session_parent isn't populated yet (first rebuild after
-                    # a wezterm-title transient, e.g. a focus loss to chrome).
-                    # Find the host directly from the live wezterm panes so
-                    # the press doesn't silently miss.
-                    panes = self._wezterm_panes()
-                    wez_windows = self._wezterm_window_index()
-                    for p in panes:
-                        if p.get("tty_name") != tty:
-                            continue
-                        w = wez_windows.get(p.get("window_id"))
-                        if w is not None:
-                            self.activate_wnck(w, t)
-                            break
+            ws_host = next(iter(registry.on_workspace(ws)), None) \
+                if ws is not None else None
+            if ws_host is not None:
+                self._tmux("switch-client", "-c", ws_host.tty, "-t", name)
+                self.activate_wnck(ws_host.wnck_window, t)
             else:
                 # Orphan session: no host wezterm on its workspace. Spawn
                 # one running `tmux attach`; it inherits the current X11
@@ -2166,11 +2224,10 @@ class Switcher(Gtk.Window):
                     pass
             return
         if is_chrome_wid(wid):
-            try:
-                tid = int(chrome_target_id(wid))
-            except ValueError:
+            tab = self._chrome_registry().tab(chrome_target_id(wid))
+            if tab is None:
                 return
-            self._chrome_call({"action": "activate", "tabId": tid})
+            self._chrome_call({"action": "activate", "tabId": int(tab.target_id)})
             host = self.wnck_window(wid)
             if host is not None:
                 self.activate_wnck(host, t)
@@ -2207,8 +2264,7 @@ class Switcher(Gtk.Window):
         # has settled and the new attached-session / active-tab title has
         # landed.
         if is_tmux_wid(wid):
-            self._panes_cache = None
-            self._tmux_cache = None
+            self._invalidate_tmux_caches()
             self.schedule(80, lambda: self.rebuild_current(keep_wid=wid))
         elif is_chrome_wid(wid):
             self._chrome_cache = None
@@ -2248,33 +2304,23 @@ class Switcher(Gtk.Window):
         idx = vis.index(row) if row in vis else 0
         if is_tmux_wid(wid):
             name = tmux_session_name(wid)
-            ws = self._ws_of_session(name)
-            tty = self._session_client_tty.get(ws) if ws is not None else None
             # If the killed session is currently attached, the wezterm
-            # client exits with tmux and takes the host window down. Try to
-            # switch the client to another session on the same workspace
-            # first; only if no fallback exists do we accept the wezterm
-            # going down (the user explicitly closed their last session).
-            if tty:
-                attached = self._tmux_clients().get(tty)
-                if attached == name:
-                    fallback = next(
-                        (s["name"] for s in self._tmux_sessions()
-                         if s["name"] != name
-                         and self._ws_of_session(s["name"]) == ws),
-                        None)
-                    if fallback is not None:
-                        self._tmux("switch-client", "-c", tty,
-                                   "-t", fallback)
+            # client exits with tmux and takes the host window down. Try
+            # to switch its client to another session on the same
+            # workspace first; only if no fallback exists do we accept
+            # the wezterm going down.
+            host = self._wezterm_hosts().for_session(name)
+            if host is not None:
+                fallback = self._sibling_session_on_ws(name, host.workspace)
+                if fallback is not None:
+                    self._tmux("switch-client", "-c", host.tty,
+                               "-t", fallback)
             self._tmux("kill-session", "-t", name)
-            self._panes_cache = None
-            self._tmux_cache = None
+            self._invalidate_tmux_caches()
         elif is_chrome_wid(wid):
-            try:
-                tid = int(chrome_target_id(wid))
-                self._chrome_call({"action": "close", "tabId": tid})
-            except ValueError:
-                pass
+            tab = self._chrome_registry().tab(chrome_target_id(wid))
+            if tab is not None:
+                self._chrome_call({"action": "close", "tabId": int(tab.target_id)})
             self._chrome_cache = None
         else:
             w = self.wnck_window(wid)
@@ -2317,31 +2363,6 @@ class Switcher(Gtk.Window):
         else:
             self.schedule(90, lambda: self.rebuild_windows(select_active=True))
 
-    def _refresh_workspace_host_tty(self, ws):
-        """Populate self._session_client_tty[ws] by scanning the live
-        wezterm panes + tmux clients. Used when a move-to-ws needs the
-        target workspace's host tty before any rebuild has run there.
-        Returns the tty, or None."""
-        panes = self._wezterm_panes()
-        wez_windows = self._wezterm_window_index() if panes else {}
-        tmux_clients = self._tmux_clients() if panes else {}
-        host_tty = None
-        for winid, parent in wez_windows.items():
-            wsobj = parent.get_workspace()
-            if wsobj is None or wsobj.get_number() != ws:
-                continue
-            for p in panes:
-                if (p.get("window_id") == winid and p.get("is_active")
-                        and p.get("tty_name")):
-                    tty = p["tty_name"]
-                    if tty in tmux_clients:
-                        host_tty = tty
-                        break
-            if host_tty:
-                break
-        self._session_client_tty[ws] = host_tty
-        return host_tty
-
     def _move_tmux_session(self, wid, delta):
         """Move a tmux session row to another workspace by renaming the
         session (ws<N>-... -> ws<M>-...). The renamed session is then
@@ -2351,87 +2372,52 @@ class Switcher(Gtk.Window):
         cleanly if there is no fallback. When a new wezterm is spawned
         on the destination, its geometry mirrors the source wezterm."""
         name = tmux_session_name(wid)
-        base = self._ws_of_session(name)
-        if base is None:
-            base = self.current_ws()
+        m = TMUX_SESSION_RE.match(name)
+        if not m:
+            return
+        base = int(m.group(1))
         target = base + delta                       # clamp, no wraparound
         if target < 0 or target >= self.num_ws():
             return
-        suffix = name.split("-", 1)
-        if len(suffix) < 2:
-            return
-        new_name = f"ws{target}-{suffix[1]}"
+        new_name = f"ws{target}-{name[m.end():]}"
 
         # Capture the source wezterm's geometry before any detach so we
         # can mirror it on the destination if a fresh wezterm spawns.
-        src_geo = None
-        src_tty = self._session_client_tty.get(base)
-        if src_tty:
-            panes = self._wezterm_panes()
-            for winid, parent in self._wezterm_window_index().items():
-                wsobj = parent.get_workspace()
-                if wsobj is None or wsobj.get_number() != base:
-                    continue
-                for p in panes:
-                    if (p.get("window_id") == winid
-                            and p.get("is_active")
-                            and p.get("tty_name") == src_tty):
-                        src_geo = parent.get_geometry()
-                        break
-                if src_geo is not None:
-                    break
-            attached = self._tmux_clients().get(src_tty)
-            if attached == name:
-                fallback = next(
-                    (s["name"] for s in self._tmux_sessions()
-                     if s["name"] != name
-                     and self._ws_of_session(s["name"]) == base),
-                    None)
-                if fallback is not None:
-                    self._tmux("switch-client", "-c", src_tty,
-                               "-t", fallback)
-                else:
-                    # No same-workspace fallback: detach the source client
-                    # so the source wezterm exits, instead of carrying the
-                    # moved session across as a cross-workspace stray.
-                    self._tmux("detach-client", "-t", src_tty)
+        registry = self._wezterm_hosts()
+        src_host = registry.for_session(name)
+        src_geo = src_host.wnck_window.get_geometry() if src_host else None
+        if src_host is not None:
+            fallback = self._sibling_session_on_ws(name, base)
+            if fallback is not None:
+                self._tmux("switch-client", "-c", src_host.tty,
+                           "-t", fallback)
+            else:
+                # No same-workspace fallback: detach the source client
+                # so the source wezterm exits, instead of carrying the
+                # moved session across as a cross-workspace stray.
+                self._tmux("detach-client", "-t", src_host.tty)
         self._tmux("rename-session", "-t", name, new_name)
-        self._panes_cache = None
-        self._tmux_cache = None
+        self._invalidate_tmux_caches()
         # Activate target workspace first so the user follows the move
         # and any spawned wezterm lands on the right X11 workspace.
         if self.mode != "ws":
             wsobj = self.screen.get_workspace(target)
             if wsobj is not None:
                 wsobj.activate(self.server_time())
-        # Snapshot xids before activating so a fresh wezterm can be
-        # identified by exclusion.
-        pre_xids = {w.get_xid() for w in self.screen.get_windows()}
-        dst_tty = self._refresh_workspace_host_tty(target)
+        # Snapshot wezterm xids before activating so a freshly-spawned
+        # wezterm can be identified by exclusion.
+        pre_xids = self._x11_xids_with_class(WEZTERM_INST)
+        dst_host = next(iter(self._wezterm_hosts().on_workspace(target)), None)
         new_wid = TMUX_WID_PREFIX + new_name
         self._activate_wid(new_wid)
-        if src_geo is not None and dst_tty is None:
+        if src_geo is not None and dst_host is None:
             # _activate_wid spawned a fresh wezterm; snap it to the source
-            # geometry once it shows up. Poll because wezterm startup time
-            # varies (cold start ~250 ms, warm ~80 ms).
-            def settle(attempt=0):
-                self.screen.force_update()
-                for w in self.screen.get_windows():
-                    if w.get_xid() in pre_xids:
-                        continue
-                    if (w.get_class_instance_name() or "").lower() != WEZTERM_INST:
-                        continue
-                    gx, gy, gw, gh = src_geo
-                    self._move_resize(w, gx, gy, gw, gh)
-                    return False
-                if attempt < 15:
-                    self.schedule(100, lambda: settle(attempt + 1))
-                return False
-            self.schedule(120, settle)
-        if self.mode == "ws":
-            self.schedule(90, lambda: self.rebuild_ws(keep_wid=new_wid))
-        else:
-            self.schedule(90, lambda: self.rebuild_windows(keep_wid=new_wid))
+            # geometry once it shows up.
+            gx, gy, gw, gh = src_geo
+            self._wait_for_new_window(
+                pre_xids, WEZTERM_INST,
+                lambda w: self._move_resize(w, gx, gy, gw, gh))
+        self.schedule(90, lambda: self.rebuild_current(keep_wid=new_wid))
 
     def _move_chrome_tab(self, wid, delta):
         """Move a chrome tab to another workspace's chrome host. If the
@@ -2439,74 +2425,37 @@ class Switcher(Gtk.Window):
         chrome.tabs.move; otherwise detach the tab into a new window via
         chrome.windows.create and wmctrl-move that window to the target.
         """
-        try:
-            tid = int(chrome_target_id(wid))
-        except ValueError:
+        registry = self._chrome_registry()
+        tab = registry.tab(chrome_target_id(wid))
+        if tab is None:
             return
-        # Source workspace = the chrome parent's workspace (via wnck_window).
-        host = self.wnck_window(wid)
-        if host is None or host.get_workspace() is None:
-            return
-        base = host.get_workspace().get_number()
-        target = base + delta                       # clamp, no wraparound
+        target = tab.workspace + delta              # clamp, no wraparound
         if target < 0 or target >= self.num_ws():
             return
-        # Look for an existing chrome window on the target workspace and
-        # match it to a CDP windowId by geometry.
-        dest_cdp = None
-        cdp_bounds = self._chrome_windows()
-        for w in self.screen.get_windows():
-            inst = (w.get_class_instance_name() or "").lower()
-            if not inst.startswith(CHROME_INST):
-                continue
-            wsobj = w.get_workspace()
-            if wsobj is None or wsobj.get_number() != target:
-                continue
-            if w.is_minimized():
-                continue
-            gx, gy, _gw, _gh = w.get_geometry()
-            for cdp_id, (cl, ct, _cw, _ch) in cdp_bounds.items():
-                if abs(cl - gx) + abs(ct - gy) <= 50:
-                    dest_cdp = cdp_id
-                    break
-            if dest_cdp is not None:
-                break
-        payload = {"action": "move_tab", "tabId": tid}
-        if dest_cdp is not None:
-            payload["windowId"] = dest_cdp
+        # If the target workspace already has a chrome host, reparent
+        # the tab into it; the registry already resolved its CDP id.
+        dest = next(iter(registry.windows_on_workspace(target)), None)
+        payload = {"action": "move_tab", "tabId": int(tab.target_id)}
+        if dest is not None:
+            payload["windowId"] = dest.cdp_id
         self._chrome_call(payload)
         self._chrome_cache = None
         # When we detached into a new window, snap that new X11 window to
         # the target workspace. Identify it as a chrome window we hadn't
         # seen before; the existing-xid set comes from the pre-move
         # snapshot.
-        if dest_cdp is None:
-            pre_xids = {w.get_xid() for w in self.screen.get_windows()
-                        if (w.get_class_instance_name() or "").lower()
-                        .startswith(CHROME_INST)}
-
-            def settle_then_move():
-                self.screen.force_update()
-                wsobj = self.screen.get_workspace(target)
-                if wsobj is None:
-                    return
-                for w in self.screen.get_windows():
-                    if w.get_xid() in pre_xids:
-                        continue
-                    if not (w.get_class_instance_name() or "") \
-                            .lower().startswith(CHROME_INST):
-                        continue
-                    w.move_to_workspace(wsobj)
-                    break
-            self.schedule(120, settle_then_move)
+        if dest is None:
+            pre_xids = self._x11_xids_with_class(CHROME_INST)
+            wsobj = self.screen.get_workspace(target)
+            if wsobj is not None:
+                self._wait_for_new_window(
+                    pre_xids, CHROME_INST,
+                    lambda new_win: new_win.move_to_workspace(wsobj))
         if self.mode != "ws":
             wsobj = self.screen.get_workspace(target)
             if wsobj is not None:
                 wsobj.activate(self.server_time())
-        if self.mode == "ws":
-            self.schedule(180, lambda: self.rebuild_ws(keep_wid=wid))
-        else:
-            self.schedule(180, lambda: self.rebuild_windows(keep_wid=wid))
+        self.schedule(180, lambda: self.rebuild_current(keep_wid=wid))
 
     def _detach_selected(self):
         """Move the selected virtual-window row into a new X11 window of
@@ -2533,6 +2482,15 @@ class Switcher(Gtk.Window):
         gx, gy, gw, gh = src.get_geometry()
         dst.unmaximize()
         self._move_resize(dst, gx, gy, gw, gh)
+
+    def _x11_xids_with_class(self, inst_prefix):
+        """xids of currently-visible X11 windows whose WM_CLASS instance
+        starts with inst_prefix. Snapshotted before an action that may
+        spawn a new window so `_wait_for_new_window` can spot the new
+        one by exclusion."""
+        return {w.get_xid() for w in self.screen.get_windows()
+                if (w.get_class_instance_name() or "")
+                .lower().startswith(inst_prefix)}
 
     def _wait_for_new_window(self, pre_xids, inst_filter, on_found,
                              attempts=15):
@@ -2564,36 +2522,18 @@ class Switcher(Gtk.Window):
         # to. Without a fallback, "detach" would just spawn another mirror
         # of the same session, which is what dug us into the four-mirror
         # state earlier; refuse instead.
-        fallback = next(
-            (s["name"] for s in self._tmux_sessions()
-             if s["name"] != name
-             and self._ws_of_session(s["name"]) == base),
-            None)
+        fallback = self._sibling_session_on_ws(name, base)
         if fallback is None:
             return
-        src_window = None
-        src_tty = self._session_client_tty.get(base)
-        if src_tty:
-            panes = self._wezterm_panes()
-            for winid, parent in self._wezterm_window_index().items():
-                wsobj = parent.get_workspace()
-                if wsobj is None or wsobj.get_number() != base:
-                    continue
-                for p in panes:
-                    if (p.get("window_id") == winid
-                            and p.get("is_active")
-                            and p.get("tty_name") == src_tty):
-                        src_window = parent
-                        break
-                if src_window is not None:
-                    break
-            attached = self._tmux_clients().get(src_tty)
-            if attached == name:
-                self._tmux("switch-client", "-c", src_tty,
-                           "-t", fallback)
-        pre_xids = {w.get_xid() for w in self.screen.get_windows()
-                    if (w.get_class_instance_name() or "")
-                    .lower() == WEZTERM_INST}
+        # Capture the wezterm attached to this session (if any) so the
+        # detached copy can mirror its geometry; switch it to the
+        # fallback so the source pane doesn't die under the user.
+        src_host = self._wezterm_hosts().for_session(name)
+        src_window = src_host.wnck_window if src_host else None
+        if src_host is not None:
+            self._tmux("switch-client", "-c", src_host.tty,
+                       "-t", fallback)
+        pre_xids = self._x11_xids_with_class(WEZTERM_INST)
         self.hide_switcher()
         try:
             subprocess.Popen(
@@ -2611,30 +2551,22 @@ class Switcher(Gtk.Window):
             lambda new_win: self._match_src_geometry(src_window, new_win))
 
     def _detach_chrome_tab(self, wid):
-        try:
-            tid = int(chrome_target_id(wid))
-        except ValueError:
-            return
         # Detach only makes sense when the source window has other tabs
         # to keep showing. Detaching the only tab in a window would just
         # move that tab to a new window and close the source -- same
         # number of windows, no side-by-side gain.
-        target_id_str = chrome_target_id(wid)
-        snap = self._chrome_snapshot()
-        src_winid = next((t.get("windowId") for t in (snap.get("tabs") or [])
-                          if str(t.get("id")) == target_id_str), None)
-        if src_winid is None:
+        registry = self._chrome_registry()
+        tab = registry.tab(chrome_target_id(wid))
+        if tab is None:
             return
-        if sum(1 for t in (snap.get("tabs") or [])
-               if t.get("windowId") == src_winid) <= 1:
+        parent = registry.window_for_cdp(tab.parent_cdp_id)
+        if parent is None or len(parent.tabs) <= 1:
             return
-        src_window = self.wnck_window(wid)
-        pre_xids = {w.get_xid() for w in self.screen.get_windows()
-                    if (w.get_class_instance_name() or "")
-                    .lower().startswith(CHROME_INST)}
+        src_window = parent.wnck_window
+        pre_xids = self._x11_xids_with_class(CHROME_INST)
         self.hide_switcher()
         # windowId omitted -> chrome.windows.create({tabId}) detaches.
-        self._chrome_call({"action": "move_tab", "tabId": tid})
+        self._chrome_call({"action": "move_tab", "tabId": int(tab.target_id)})
         self._chrome_cache = None
         self._wait_for_new_window(
             pre_xids, CHROME_INST,
@@ -2653,47 +2585,21 @@ class Switcher(Gtk.Window):
             self._reattach_chrome_tab(wid)
 
     def _reattach_chrome_tab(self, wid):
-        try:
-            tid = int(chrome_target_id(wid))
-        except ValueError:
+        registry = self._chrome_registry()
+        tab = registry.tab(chrome_target_id(wid))
+        if tab is None:
             return
-        snap = self._chrome_snapshot()
-        tabs = snap.get("tabs") or []
-        target_id_str = chrome_target_id(wid)
-        src_winid = next((t.get("windowId") for t in tabs
-                          if str(t.get("id")) == target_id_str), None)
-        if src_winid is None:
+        parent = registry.window_for_cdp(tab.parent_cdp_id)
+        if parent is None or len(parent.tabs) != 1:
+            return  # source isn't a lone-tab window; nothing to reattach
+        peers = [w for w in registry.windows_on_workspace(self.current_ws())
+                 if w.cdp_id != parent.cdp_id]
+        if not peers:
             return
-        # Lone-tab check: the source CDP window has exactly this one tab.
-        if sum(1 for t in tabs if t.get("windowId") == src_winid) != 1:
-            return
-        # Restrict to chrome windows on the current workspace.
-        ws = self.current_ws()
-        ws_cdp_ids = set()
-        for w in self.screen.get_windows():
-            if not (w.get_class_instance_name() or "") \
-                    .lower().startswith(CHROME_INST):
-                continue
-            wsobj = w.get_workspace()
-            if wsobj is None or wsobj.get_number() != ws:
-                continue
-            if w.is_minimized():
-                continue
-            cdp_id = self._chrome_xid_to_cdp.get(w.get_xid())
-            if cdp_id is not None:
-                ws_cdp_ids.add(cdp_id)
-        if src_winid not in ws_cdp_ids or len(ws_cdp_ids) < 2:
-            return
-        counts = {}
-        for t in tabs:
-            twin = t.get("windowId")
-            if twin in ws_cdp_ids and twin != src_winid:
-                counts[twin] = counts.get(twin, 0) + 1
-        if not counts:
-            return
-        dest_winid = max(counts, key=counts.get)
+        dest = max(peers, key=lambda w: len(w.tabs))
         self._chrome_call({"action": "move_tab",
-                           "tabId": tid, "windowId": dest_winid})
+                           "tabId": int(tab.target_id),
+                           "windowId": dest.cdp_id})
         self._chrome_cache = None
         self.hide_switcher()
 
@@ -2703,50 +2609,27 @@ class Switcher(Gtk.Window):
         if ws is None:
             return
         ws_prefix = f"ws{ws}-"
-        # Gather (host_window, host_tty, attached_session) for every
-        # wezterm host on this workspace that's hosting a ws<N>- session.
-        panes = self._wezterm_panes()
-        wez_windows = self._wezterm_window_index()
-        tmux_clients = self._tmux_clients()
-        ws_hosts = []
-        for winid, parent in wez_windows.items():
-            wsobj = parent.get_workspace()
-            if wsobj is None or wsobj.get_number() != ws:
-                continue
-            host_tty = None
-            for p in panes:
-                if (p.get("window_id") == winid
-                        and p.get("is_active")
-                        and p.get("tty_name") in tmux_clients):
-                    host_tty = p["tty_name"]
-                    break
-            if host_tty is None:
-                continue
-            sess = tmux_clients[host_tty]
-            if sess.startswith(ws_prefix):
-                ws_hosts.append((parent, host_tty, sess))
+        ws_hosts = [h for h in self._wezterm_hosts().on_workspace(ws)
+                    if h.session.startswith(ws_prefix)]
         if len(ws_hosts) < 2:
             return
         # Lone check: exactly one host attached to this session. If the
         # session is mirrored across multiple wezterms (common after
         # repeated detaches without a fallback), bail rather than pick
         # one mirror to detach and leave the rest hanging.
-        hosts_for_name = [h for h in ws_hosts if h[2] == name]
+        hosts_for_name = [h for h in ws_hosts if h.session == name]
         if len(hosts_for_name) != 1:
             return
         src = hosts_for_name[0]
         dest = next((h for h in ws_hosts if h is not src), None)
         if dest is None:
             return
-        _, dest_tty, _ = dest
-        _, src_tty, _ = src
         # Switch destination host to this session, then drop the source
         # client so its wezterm exits. Destination's previous session
         # remains in the pool (detached) and reachable via frofi.
-        self._tmux("switch-client", "-c", dest_tty, "-t", name)
-        self._tmux("detach-client", "-t", src_tty)
-        self._panes_cache = None
-        self._tmux_cache = None
+        self._tmux("switch-client", "-c", dest.tty, "-t", name)
+        self._tmux("detach-client", "-t", src.tty)
+        self._invalidate_tmux_caches()
         self.hide_switcher()
 
     def switch_ws(self, delta):
