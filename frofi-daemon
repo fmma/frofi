@@ -1662,7 +1662,11 @@ class Switcher(Gtk.Window):
         for wid in ordered_ids:
             if wid in in_slot:
                 continue
-            for i in range(12):
+            # Chrome rows fill from F12 down so terminals and chromes don't
+            # compete for F1-F4; they only collide once the workspace has
+            # more than 12 windows.
+            rng = range(11, -1, -1) if is_chrome_wid(wid) else range(12)
+            for i in rng:
                 if not slots[i]:
                     slots[i] = wid
                     in_slot.add(wid)
