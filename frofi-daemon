@@ -2365,11 +2365,17 @@ class Switcher(Gtk.Window):
         self.schedule(60, reassert)
 
     def launch_app(self, desktop_id):
-        if GLib.find_program_in_path("gtk-launch"):
-            subprocess.Popen(["gtk-launch", desktop_id])
-        else:
-            subprocess.Popen(["gio", "launch",
-                              os.path.join(DESKTOP_DIRS[0], desktop_id)])
+        # Detach from the daemon's stdio and process group so the launched
+        # app survives a daemon restart and isn't killed by a broken pipe
+        # on the daemon's stderr.
+        argv = (["gtk-launch", desktop_id]
+                if GLib.find_program_in_path("gtk-launch")
+                else ["gio", "launch", os.path.join(DESKTOP_DIRS[0], desktop_id)])
+        subprocess.Popen(argv,
+                         stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL,
+                         start_new_session=True)
 
     def jump_slot(self, n):
         if 1 <= n <= 12 and self.slots[n - 1]:
