@@ -1720,27 +1720,24 @@ class Switcher(Gtk.Window):
                     continue
                 if not isinstance(wids, list) or len(wids) != 12:
                     continue
-                try:
-                    self.slot_map[ws] = [int(w) if w else "" for w in wids]
-                except (TypeError, ValueError):
+                if not all(w is None or isinstance(w, str) for w in wids):
                     continue
+                self.slot_map[ws] = [w or "" for w in wids]
         tags = data.get("tags")
         if isinstance(tags, dict):
-            for wid_str, tag in tags.items():
-                try:
-                    self.tags[int(wid_str)] = str(tag)
-                except (TypeError, ValueError):
-                    continue
+            for wid, tag in tags.items():
+                if isinstance(wid, str) and isinstance(tag, str):
+                    self.tags[wid] = tag
 
     def _save_state(self):
         self._state_save_timer = None
         data = {
             "version": 1,
             "slots": {
-                str(ws): [int(w) if w else None for w in slots]
+                str(ws): [w if w else None for w in slots]
                 for ws, slots in self.slot_map.items()
             },
-            "tags": {str(wid): tag for wid, tag in self.tags.items()},
+            "tags": dict(self.tags),
         }
         try:
             os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
