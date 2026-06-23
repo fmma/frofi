@@ -1655,17 +1655,14 @@ class Switcher(Gtk.Window):
     def slots_for(self, ws):
         return self.slot_map.setdefault(ws, [""] * 12)
 
-    def refresh_slots(self, ws, ordered_ids, reverse_wids=()):
+    def refresh_slots(self, ws, ordered_ids):
         """Prune dead slots and fill empties from the live window list.
 
         Mutates the workspace's slot list in place. State is persisted via
         _mark_dirty, so the assignment lives across daemon restarts.
-        Wids in reverse_wids fill from F12 down so they don't compete with
-        non-reverse rows for the low F-keys.
         """
         slots = self.slots_for(ws)
         cur = set(ordered_ids)
-        reverse_wids = set(reverse_wids)
         changed = False
         for i in range(12):
             if slots[i] and slots[i] not in cur:
@@ -1675,8 +1672,7 @@ class Switcher(Gtk.Window):
         for wid in ordered_ids:
             if wid in in_slot:
                 continue
-            rng = range(11, -1, -1) if wid in reverse_wids else range(12)
-            for i in rng:
+            for i in range(12):
                 if not slots[i]:
                     slots[i] = wid
                     in_slot.add(wid)
@@ -1874,9 +1870,7 @@ class Switcher(Gtk.Window):
         ws = self.current_ws()
         win_rows, all_ids = self.list_windows(ws)
         self._prune_tags(all_ids)
-        self.slots = self.refresh_slots(
-            ws, [r[0] for r in win_rows],
-            reverse_wids=[r[0] for r in win_rows if r[1] == CHROME_INST])
+        self.slots = self.refresh_slots(ws, [r[0] for r in win_rows])
         active_wid = self.active_wid_str()
         self._active_geo = None
         keep_row, active_row = self._emit_group(win_rows, self.slots,
@@ -1909,9 +1903,7 @@ class Switcher(Gtk.Window):
         for ws in range(self.num_ws()):
             self.add_separator(self._ws_label(ws), ws_group=ws)
             win_rows, all_ids = self.list_windows(ws)   # all_ids is ws-agnostic
-            slots = self.refresh_slots(
-                ws, [r[0] for r in win_rows],
-                reverse_wids=[r[0] for r in win_rows if r[1] == CHROME_INST])
+            slots = self.refresh_slots(ws, [r[0] for r in win_rows])
             if ws == cur:
                 self.slots = slots          # F-keys still target the current ws
             kr, ar = self._emit_group(win_rows, slots, keep_wid, active_wid,
@@ -3064,9 +3056,7 @@ def run_daemon():
         elif parts[0] == "focus-slot" and len(parts) == 2:
             ws = win.current_ws()
             _rows, _all = win.list_windows(ws)
-            slots = win.refresh_slots(
-                ws, [r[0] for r in _rows],
-                reverse_wids=[r[0] for r in _rows if r[1] == CHROME_INST])
+            slots = win.refresh_slots(ws, [r[0] for r in _rows])
             try:
                 n = int(parts[1])
             except ValueError:
