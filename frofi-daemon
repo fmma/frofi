@@ -2945,6 +2945,10 @@ class Switcher(Gtk.Window):
         if ctrl and alt and key == Gdk.KEY_Right:
             self.switch_ws(1)
             return True
+        # XF86Launch5-7 mirror the global switch-to-workspace-1/2/3 bindings.
+        if Gdk.KEY_Launch5 <= key <= Gdk.KEY_Launch7:
+            self.switch_ws(key - Gdk.KEY_Launch5 - self.current_ws())
+            return True
         if ctrl and not shift and not alt and not sup and key in (Gdk.KEY_f,
                                                                   Gdk.KEY_F):
             self.toggle_fkeys()
